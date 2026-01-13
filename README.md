@@ -246,3 +246,4 @@ PR 作成とコメントは許可、approve/request_changes は禁止。
 
 - **Git LFS 非対応**: git smart HTTP protocol の基本操作（clone/fetch/push）のみ対応
 - **GitHub API のページネーション**: プロキシはレスポンスをそのまま転送するため、クライアント側で処理が必要
+- **GraphQL (実験的)**: `addDiscussionComment` mutation のみ対応。既知のセキュリティ問題あり（[#2](https://github.com/carrotRakko/github-finest-grained-permission-proxy/issues/2)）。本番環境での使用は非推奨
