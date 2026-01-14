@@ -703,6 +703,8 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 **os.environ,
                 "GH_TOKEN": pat,
                 "GH_HOST": "github.com",
+                "GH_FORCE_TTY": "1",
+                "NO_COLOR": "1",
             }
         )
 
