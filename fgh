@@ -91,7 +91,9 @@ call_proxy_cli() {
     if [[ -n "$stderr" ]]; then
         echo "$stderr" >&2
     fi
-    echo "$stdout"
+    if [[ -n "$stdout" ]]; then
+        echo "$stdout"
+    fi
 }
 
 # sub-issue コマンドのヘルプ
