@@ -239,7 +239,7 @@ ALL_ACTIONS = [
     "issues:read", "issues:write",
     "git:read", "git:write",
     "discussions:write",
-    "subissues:add", "subissues:remove", "subissues:reprioritize",
+    "subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize",
 ] + PR_LAYER1_ACTIONS
 
 # カテゴリごとのアクション（ワイルドカード展開用）
@@ -252,7 +252,7 @@ ACTION_CATEGORIES = {
     "pr": PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
     "discussions": ["discussions:write"],
-    "subissues": ["subissues:add", "subissues:remove", "subissues:reprioritize"],
+    "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
 }
 
 
@@ -802,7 +802,11 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         full_repo = f"{owner}/{repo}"
 
         # オペレーション判定
-        if path == "/graphql-ops/sub-issues/add":
+        if path == "/graphql-ops/sub-issues/list":
+            action = "subissues:list"
+        elif path == "/graphql-ops/sub-issues/parent":
+            action = "subissues:parent"
+        elif path == "/graphql-ops/sub-issues/add":
             action = "subissues:add"
         elif path == "/graphql-ops/sub-issues/remove":
             action = "subissues:remove"
@@ -820,7 +824,17 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
         # オペレーション実行
         try:
-            if action == "subissues:add":
+            if action == "subissues:list":
+                if not issue_number:
+                    self.send_error(400, "issue_number is required")
+                    return
+                result = self.execute_list_sub_issues(owner, repo, issue_number)
+            elif action == "subissues:parent":
+                if not issue_number:
+                    self.send_error(400, "issue_number is required")
+                    return
+                result = self.execute_get_parent_issue(owner, repo, issue_number)
+            elif action == "subissues:add":
                 if not issue_number or not sub_issue_number:
                     self.send_error(400, "issue_number and sub_issue_number are required")
                     return
@@ -890,6 +904,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "Authorization": f"bearer {self.config['classic_pat']}",
             "Content-Type": "application/json",
             "User-Agent": "github-proxy/1.0",
+            "GraphQL-Features": "sub_issues",
         }
 
         req = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
@@ -899,6 +914,58 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             if "errors" in result:
                 raise ValueError(f"GraphQL error: {result['errors']}")
             return result
+
+    def execute_list_sub_issues(self, owner: str, repo: str, issue_number: int) -> dict:
+        """Issue の sub-issues 一覧を取得"""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    subIssues(first: 50) {
+                        nodes {
+                            number
+                            title
+                            state
+                        }
+                    }
+                }
+            }
+        }
+        """
+        variables = {"owner": owner, "repo": repo, "number": issue_number}
+        result = self.execute_graphql(query, variables)
+
+        issue = result.get("data", {}).get("repository", {}).get("issue")
+        if not issue:
+            raise ValueError(f"Issue #{issue_number} not found in {owner}/{repo}")
+
+        sub_issues = issue.get("subIssues", {}).get("nodes", [])
+        return {"sub_issues": sub_issues}
+
+    def execute_get_parent_issue(self, owner: str, repo: str, issue_number: int) -> dict:
+        """Issue の親 issue を取得"""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    parent {
+                        number
+                        title
+                        state
+                    }
+                }
+            }
+        }
+        """
+        variables = {"owner": owner, "repo": repo, "number": issue_number}
+        result = self.execute_graphql(query, variables)
+
+        issue = result.get("data", {}).get("repository", {}).get("issue")
+        if not issue:
+            raise ValueError(f"Issue #{issue_number} not found in {owner}/{repo}")
+
+        parent = issue.get("parent")
+        return {"parent": parent}
 
     def execute_add_sub_issue(
         self, owner: str, repo: str, issue_number: int, sub_issue_number: int,

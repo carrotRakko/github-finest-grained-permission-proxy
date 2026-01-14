@@ -289,6 +289,132 @@ sub-issue_reorder() {
     fi
 }
 
+# =============================================================================
+# プロキシ経由の sub-issue 操作
+# =============================================================================
+
+# プロキシ経由で sub-issues 一覧を取得
+proxy_sub-issue_list() {
+    local owner="$1"
+    local repo="$2"
+    local issue_number="$3"
+
+    local result
+    result=$(curl -s -X POST "${FGP_PROXY_URL}/graphql-ops/sub-issues/list" \
+        -H "Content-Type: application/json" \
+        -d "{\"owner\":\"$owner\",\"repo\":\"$repo\",\"issue_number\":$issue_number}")
+
+    # エラーチェック
+    if echo "$result" | grep -q '"error"'; then
+        echo "$result" | jq -r '.error // .message // .' >&2
+        return 1
+    fi
+
+    # 結果をフォーマット
+    echo "$result" | jq -r '.sub_issues[] | "\(.number)\t\(.state)\t\(.title)"'
+}
+
+# プロキシ経由で親 issue を取得
+proxy_sub-issue_parent() {
+    local owner="$1"
+    local repo="$2"
+    local issue_number="$3"
+
+    local result
+    result=$(curl -s -X POST "${FGP_PROXY_URL}/graphql-ops/sub-issues/parent" \
+        -H "Content-Type: application/json" \
+        -d "{\"owner\":\"$owner\",\"repo\":\"$repo\",\"issue_number\":$issue_number}")
+
+    # エラーチェック
+    if echo "$result" | grep -q '"error"'; then
+        echo "$result" | jq -r '.error // .message // .' >&2
+        return 1
+    fi
+
+    # 結果をフォーマット
+    local parent
+    parent=$(echo "$result" | jq -r '.parent')
+    if [[ "$parent" == "null" ]]; then
+        echo "No parent issue"
+    else
+        echo "$result" | jq -r '.parent | "\(.number)\t\(.state)\t\(.title)"'
+    fi
+}
+
+# プロキシ経由で sub-issue を追加
+proxy_sub-issue_add() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+
+    local result
+    result=$(curl -s -X POST "${FGP_PROXY_URL}/graphql-ops/sub-issues/add" \
+        -H "Content-Type: application/json" \
+        -d "{\"owner\":\"$owner\",\"repo\":\"$repo\",\"issue_number\":$parent_number,\"sub_issue_number\":$child_number}")
+
+    # エラーチェック
+    if echo "$result" | grep -q '"error"'; then
+        echo "$result" | jq -r '.error // .message // .' >&2
+        return 1
+    fi
+
+    echo "$result" | jq -r '"Added #\(.sub_issue_number) as sub-issue of #\(.issue_number)"'
+}
+
+# プロキシ経由で sub-issue を削除
+proxy_sub-issue_remove() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+
+    local result
+    result=$(curl -s -X POST "${FGP_PROXY_URL}/graphql-ops/sub-issues/remove" \
+        -H "Content-Type: application/json" \
+        -d "{\"owner\":\"$owner\",\"repo\":\"$repo\",\"issue_number\":$parent_number,\"sub_issue_number\":$child_number}")
+
+    # エラーチェック
+    if echo "$result" | grep -q '"error"'; then
+        echo "$result" | jq -r '.error // .message // .' >&2
+        return 1
+    fi
+
+    echo "$result" | jq -r '"Removed #\(.sub_issue_number) from #\(.issue_number)"'
+}
+
+# プロキシ経由で sub-issue を並び替え
+proxy_sub-issue_reorder() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+    local before_number="$5"
+    local after_number="$6"
+
+    local body="{\"owner\":\"$owner\",\"repo\":\"$repo\",\"issue_number\":$parent_number,\"sub_issue_number\":$child_number"
+    if [[ -n "$before_number" ]]; then
+        body="$body,\"before_number\":$before_number"
+    fi
+    if [[ -n "$after_number" ]]; then
+        body="$body,\"after_number\":$after_number"
+    fi
+    body="$body}"
+
+    local result
+    result=$(curl -s -X POST "${FGP_PROXY_URL}/graphql-ops/sub-issues/reprioritize" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    # エラーチェック
+    if echo "$result" | grep -q '"error"'; then
+        echo "$result" | jq -r '.error // .message // .' >&2
+        return 1
+    fi
+
+    echo "Reordered"
+}
+
 # sub-issue コマンドのメイン
 handle_sub-issue() {
     local action="$1"
@@ -376,6 +502,12 @@ EOF
         esac
     done
 
+    # プロキシ対象かどうか判定
+    local use_proxy=false
+    if is_proxy_target "$repo"; then
+        use_proxy=true
+    fi
+
     case "$action" in
         list)
             local issue_number="${filtered_args[0]}"
@@ -383,7 +515,11 @@ EOF
                 echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
-            sub-issue_list "$owner" "$reponame" "$issue_number"
+            if $use_proxy; then
+                proxy_sub-issue_list "$owner" "$reponame" "$issue_number"
+            else
+                sub-issue_list "$owner" "$reponame" "$issue_number"
+            fi
             ;;
         add)
             local parent="${filtered_args[0]}"
@@ -393,7 +529,11 @@ EOF
                 echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
-            sub-issue_add "$owner" "$reponame" "$parent" "$child"
+            if $use_proxy; then
+                proxy_sub-issue_add "$owner" "$reponame" "$parent" "$child"
+            else
+                sub-issue_add "$owner" "$reponame" "$parent" "$child"
+            fi
             ;;
         remove)
             local parent="${filtered_args[0]}"
@@ -403,7 +543,11 @@ EOF
                 echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
-            sub-issue_remove "$owner" "$reponame" "$parent" "$child"
+            if $use_proxy; then
+                proxy_sub-issue_remove "$owner" "$reponame" "$parent" "$child"
+            else
+                sub-issue_remove "$owner" "$reponame" "$parent" "$child"
+            fi
             ;;
         parent)
             local child="${filtered_args[0]}"
@@ -411,7 +555,11 @@ EOF
                 echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
-            sub-issue_parent "$owner" "$reponame" "$child"
+            if $use_proxy; then
+                proxy_sub-issue_parent "$owner" "$reponame" "$child"
+            else
+                sub-issue_parent "$owner" "$reponame" "$child"
+            fi
             ;;
         reorder)
             local parent="${filtered_args[0]}"
@@ -425,7 +573,11 @@ EOF
                 echo "required flag not set: --before or --after" >&2
                 return 1
             fi
-            sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
+            if $use_proxy; then
+                proxy_sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
+            else
+                sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
+            fi
             ;;
         *)
             echo "unknown command: $action" >&2
