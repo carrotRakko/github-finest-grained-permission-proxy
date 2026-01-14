@@ -699,7 +699,8 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             timeout=60,
             env={
                 **os.environ,
-                "GH_TOKEN": pat
+                "GH_TOKEN": pat,
+                "GH_HOST": "github.com",
             }
         )
 
