@@ -571,6 +571,8 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.handle_graphql_request(method)
         elif path.startswith("/graphql-ops/sub-issues/"):
             self.handle_sub_issues_request(method, path)
+        elif path == "/cli":
+            self.handle_cli_request(method)
         elif path == "/proxy-repos":
             self.handle_proxy_repos_request(method)
         else:
@@ -597,6 +599,204 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(result).encode("utf-8"))
+
+    def handle_cli_request(self, method: str):
+        """CLI コマンドを受け取って gh を実行する（fgh 用）"""
+        if method != "POST":
+            self.send_error(405, "Only POST is allowed")
+            return
+
+        # リクエストボディの読み取り
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self.send_error(400, "Request body required")
+            return
+
+        body = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON in request body")
+            return
+
+        args = data.get("args", [])
+        repo = data.get("repo")
+
+        if not args:
+            self.send_error(400, "args is required")
+            return
+
+        if not repo:
+            self.send_error(400, "repo is required")
+            return
+
+        # コマンドから action を判定
+        action = self.cli_args_to_action(args)
+        if action is None:
+            self.send_error(403, f"Unknown or unsupported command: {args}")
+            return
+
+        # ポリシー評価
+        allowed, reason = evaluate_policy(action, repo, self.config["rules"])
+        if not allowed:
+            self.send_error(403, reason)
+            return
+
+        # コマンド実行
+        try:
+            cmd = args[0]
+            owner, repo_name = repo.split("/")
+
+            # sub-issue コマンドは GraphQL で実行（gh にはないカスタムコマンド）
+            if cmd == "sub-issue":
+                result = self.execute_sub_issue_cli(args[1:], owner, repo_name)
+            else:
+                # 標準の gh コマンドは subprocess で実行
+                result = self.execute_gh_cli(args, repo)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+
+        except ValueError as e:
+            self.send_error(400, str(e))
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def execute_gh_cli(self, args: list[str], repo: str) -> dict:
+        """標準の gh コマンドを subprocess で実行"""
+        import subprocess
+        import os
+
+        gh_args = ["gh"] + args + ["-R", repo]
+
+        result = subprocess.run(
+            gh_args,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "GH_TOKEN": self.config["classic_pat"]
+            }
+        )
+
+        return {
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+
+    def execute_sub_issue_cli(self, args: list[str], owner: str, repo: str) -> dict:
+        """sub-issue コマンドを GraphQL で実行"""
+        if not args:
+            raise ValueError("sub-issue subcommand required")
+
+        subcmd = args[0]
+        rest = args[1:]
+
+        if subcmd == "list":
+            if not rest:
+                raise ValueError("issue number required")
+            issue_number = int(rest[0])
+            result = self.execute_list_sub_issues(owner, repo, issue_number)
+            # stdout 形式に変換
+            lines = []
+            for item in result.get("sub_issues", []):
+                lines.append(f"{item['number']}\t{item['state']}\t{item['title']}")
+            return {"exit_code": 0, "stdout": "\n".join(lines), "stderr": ""}
+
+        elif subcmd == "parent":
+            if not rest:
+                raise ValueError("issue number required")
+            issue_number = int(rest[0])
+            result = self.execute_get_parent_issue(owner, repo, issue_number)
+            parent = result.get("parent")
+            if parent:
+                stdout = f"{parent['number']}\t{parent['state']}\t{parent['title']}"
+            else:
+                stdout = "No parent issue"
+            return {"exit_code": 0, "stdout": stdout, "stderr": ""}
+
+        elif subcmd == "add":
+            if len(rest) < 2:
+                raise ValueError("parent and child issue numbers required")
+            parent_number = int(rest[0])
+            child_number = int(rest[1])
+            self.execute_add_sub_issue(owner, repo, parent_number, child_number)
+            return {"exit_code": 0, "stdout": f"Added #{child_number} as sub-issue of #{parent_number}", "stderr": ""}
+
+        elif subcmd == "remove":
+            if len(rest) < 2:
+                raise ValueError("parent and child issue numbers required")
+            parent_number = int(rest[0])
+            child_number = int(rest[1])
+            self.execute_remove_sub_issue(owner, repo, parent_number, child_number)
+            return {"exit_code": 0, "stdout": f"Removed #{child_number} from #{parent_number}", "stderr": ""}
+
+        elif subcmd == "reorder":
+            if len(rest) < 2:
+                raise ValueError("parent and child issue numbers required")
+            parent_number = int(rest[0])
+            child_number = int(rest[1])
+            # --before/--after を探す
+            before_number = None
+            after_number = None
+            i = 2
+            while i < len(rest):
+                if rest[i] == "--before" and i + 1 < len(rest):
+                    before_number = int(rest[i + 1])
+                    i += 2
+                elif rest[i] == "--after" and i + 1 < len(rest):
+                    after_number = int(rest[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            if not before_number and not after_number:
+                raise ValueError("--before or --after required")
+            self.execute_reprioritize_sub_issue(owner, repo, parent_number, child_number, before_number, after_number)
+            return {"exit_code": 0, "stdout": "Reordered", "stderr": ""}
+
+        else:
+            raise ValueError(f"Unknown sub-issue subcommand: {subcmd}")
+
+    def cli_args_to_action(self, args: list[str]) -> str | None:
+        """CLI 引数から action を判定"""
+        if len(args) < 2:
+            return None
+
+        cmd = args[0]
+        subcmd = args[1]
+
+        # sub-issue コマンド
+        if cmd == "sub-issue":
+            action_map = {
+                "list": "subissues:list",
+                "parent": "subissues:parent",
+                "add": "subissues:add",
+                "remove": "subissues:remove",
+                "reorder": "subissues:reprioritize",
+            }
+            return action_map.get(subcmd)
+
+        # issue コマンド
+        if cmd == "issue":
+            if subcmd in ["list", "view"]:
+                return "issues:read"
+            elif subcmd in ["create", "edit", "close", "reopen", "comment"]:
+                return "issues:write"
+
+        # pr コマンド
+        if cmd == "pr":
+            if subcmd in ["list", "view", "diff", "checks"]:
+                return "pr:list"  # 簡易マッピング
+            elif subcmd in ["create", "edit", "close", "merge", "comment"]:
+                return "pr:create"  # 簡易マッピング
+
+        return None
 
     def handle_git_request(self, method: str):
         """git smart HTTP protocol のリクエスト処理"""
