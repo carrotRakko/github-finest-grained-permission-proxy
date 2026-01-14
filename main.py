@@ -228,6 +228,8 @@ BUNDLE_EXPANSION = {
     "pull-requests:read": PULL_REQUESTS_READ_ACTIONS,
     "pull-requests:write": PULL_REQUESTS_READ_ACTIONS + PULL_REQUESTS_WRITE_ONLY_ACTIONS,
     "pulls:contribute": PULL_REQUESTS_READ_ACTIONS + PULLS_CONTRIBUTE_ONLY_ACTIONS,
+    # CLI 高レベル action → 層1 展開
+    "pr:merge": ["pr:merge_commit", "pr:merge_squash", "pr:merge_rebase"],
 }
 
 # ワイルドカード展開用のアクション一覧
@@ -837,6 +839,15 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             elif subcmd in ["edit", "close", "reopen"]:
                 return "pr:write", None
             elif subcmd == "merge":
+                # Layer 1: detect merge method from args
+                if "--squash" in args or "-s" in args:
+                    return "pr:merge_squash", None
+                elif "--rebase" in args or "-r" in args:
+                    return "pr:merge_rebase", None
+                elif "--merge" in args or "-m" in args:
+                    return "pr:merge_commit", None
+                # No option specified - gh will error in non-interactive mode
+                # Return layer 2 action which will be expanded during evaluation
                 return "pr:merge", None
             elif subcmd in ["comment"]:
                 return "pr:comment", None
