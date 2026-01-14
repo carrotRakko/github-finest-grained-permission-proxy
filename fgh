@@ -1,0 +1,204 @@
+#!/bin/bash
+#
+# fgh - finest-grained gh
+#
+# gh CLI のラッパー。プロキシ対象リポジトリはプロキシ経由で API を叩き、
+# それ以外は gh にパススルーする。
+#
+# Usage:
+#   fgh issue list
+#   fgh pr view 123
+#   fgh api /repos/owner/repo/issues
+#
+# Environment:
+#   FGP_PROXY_URL  - プロキシの URL (default: http://host.docker.internal:8766)
+#
+
+set -e
+
+FGP_PROXY_URL="${FGP_PROXY_URL:-http://host.docker.internal:8766}"
+CACHE_FILE="/tmp/fgh-proxy-repos-$$"
+CACHE_TTL=300  # 5 minutes
+
+# プロキシ対象リポジトリを取得（キャッシュ付き）
+get_proxy_repos() {
+    # キャッシュが有効ならそれを使う
+    if [[ -f "$CACHE_FILE" ]]; then
+        local age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null)))
+        if [[ $age -lt $CACHE_TTL ]]; then
+            cat "$CACHE_FILE"
+            return
+        fi
+    fi
+
+    # プロキシから取得
+    local repos
+    repos=$(curl -s "${FGP_PROXY_URL}/proxy-repos" 2>/dev/null | jq -r '.repos[]' 2>/dev/null) || true
+
+    if [[ -n "$repos" ]]; then
+        echo "$repos" > "$CACHE_FILE"
+        echo "$repos"
+    fi
+}
+
+# git remote から owner/repo を取得
+get_repo_from_git() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null) || return 1
+
+    # パターン: github.com/owner/repo または host.docker.internal:8766/git/owner/repo
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    elif [[ "$remote_url" =~ /git/([^/]+)/([^/.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+}
+
+# -R/--repo オプションから owner/repo を取得
+get_repo_from_args() {
+    local args=("$@")
+    for ((i=0; i<${#args[@]}; i++)); do
+        if [[ "${args[i]}" == "-R" || "${args[i]}" == "--repo" ]]; then
+            echo "${args[i+1]}"
+            return
+        fi
+        if [[ "${args[i]}" =~ ^-R(.+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return
+        fi
+        if [[ "${args[i]}" =~ ^--repo=(.+)$ ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return
+        fi
+    done
+}
+
+# リポジトリがプロキシ対象か判定
+is_proxy_target() {
+    local repo="$1"
+    local proxy_repos
+    proxy_repos=$(get_proxy_repos)
+
+    # case-insensitive で比較
+    echo "$proxy_repos" | grep -iq "^${repo}$"
+}
+
+# gh サブコマンドを API エンドポイントに変換
+# 引数: repo subcommand action [args...]
+gh_to_api() {
+    local repo="$1"
+    local subcommand="$2"
+    local action="$3"
+    shift 3
+
+    case "$subcommand" in
+        issue)
+            case "$action" in
+                list)
+                    echo "GET" "/repos/${repo}/issues"
+                    ;;
+                view)
+                    local num="$1"
+                    echo "GET" "/repos/${repo}/issues/${num}"
+                    ;;
+                create)
+                    echo "POST" "/repos/${repo}/issues"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        pr)
+            case "$action" in
+                list)
+                    echo "GET" "/repos/${repo}/pulls"
+                    ;;
+                view)
+                    local num="$1"
+                    echo "GET" "/repos/${repo}/pulls/${num}"
+                    ;;
+                create)
+                    echo "POST" "/repos/${repo}/pulls"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# プロキシ経由で API を叩く
+call_proxy() {
+    local method="$1"
+    local path="$2"
+    shift 2
+
+    local url="${FGP_PROXY_URL}${path}"
+
+    case "$method" in
+        GET)
+            curl -s "$url"
+            ;;
+        POST|PUT|PATCH|DELETE)
+            # 残りの引数から body を構築（簡易実装）
+            curl -s -X "$method" -H "Content-Type: application/json" "$url" "$@"
+            ;;
+    esac
+}
+
+# メイン
+main() {
+    if [[ $# -eq 0 ]]; then
+        gh
+        return
+    fi
+
+    local subcommand="$1"
+
+    # api サブコマンドは特別扱い
+    if [[ "$subcommand" == "api" ]]; then
+        shift
+        local path="$1"
+        # path から repo を抽出
+        if [[ "$path" =~ ^/repos/([^/]+/[^/]+) ]]; then
+            local repo="${BASH_REMATCH[1]}"
+            if is_proxy_target "$repo"; then
+                call_proxy "GET" "$path"
+                return
+            fi
+        fi
+        gh api "$@"
+        return
+    fi
+
+    # owner/repo を取得
+    local repo
+    repo=$(get_repo_from_args "$@")
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_git)
+    fi
+
+    # リポジトリが特定できない、またはプロキシ対象外なら gh にパススルー
+    if [[ -z "$repo" ]] || ! is_proxy_target "$repo"; then
+        gh "$@"
+        return
+    fi
+
+    # プロキシ経由で API を叩く
+    local api_info
+    api_info=$(gh_to_api "$repo" "$@" 2>/dev/null) || {
+        # 変換できないコマンドは gh にパススルー
+        gh "$@"
+        return
+    }
+
+    read -r method path extra <<< "$api_info"
+    call_proxy "$method" "$path"
+}
+
+main "$@"
