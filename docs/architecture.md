@@ -188,7 +188,7 @@ fgp
 ## 実装状況
 
 - [x] `/cli` エンドポイント（fgp）
-- [ ] fgh を薄いクライアント化（全コマンドを /cli に転送）
-- [ ] PAT 選択ロジック（fine-grained × n + classic fallback）
-- [ ] 旧エンドポイント削除（/proxy-repos, /graphql-ops/sub-issues/*）
-- [ ] fgh から sub-issue 実装を削除（fgp に一元化）
+- [x] fgh を薄いクライアント化（全コマンドを /cli に転送）
+- [x] PAT 選択ロジック（fine-grained × n + classic fallback）
+- [x] 旧エンドポイント削除（/proxy-repos, /graphql-ops/sub-issues/*）
+- [x] fgh から sub-issue 実装を削除（fgp に一元化）
