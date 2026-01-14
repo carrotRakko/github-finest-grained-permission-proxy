@@ -643,9 +643,12 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             return
 
         # コマンドから action を判定
-        action = self.cli_args_to_action(args)
+        action, error_message = self.cli_args_to_action(args)
         if action is None:
-            self.send_error(403, f"Unknown or unsupported command: {args}")
+            if error_message:
+                self.send_error(403, error_message)
+            else:
+                self.send_error(403, f"Unknown or unsupported command: {args}")
             return
 
         # ポリシー評価
@@ -777,13 +780,31 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         else:
             raise ValueError(f"Unknown sub-issue subcommand: {subcmd}")
 
-    def cli_args_to_action(self, args: list[str]) -> str | None:
-        """CLI 引数から action を判定"""
-        if len(args) < 2:
-            return None
+    def cli_args_to_action(self, args: list[str]) -> tuple[str | None, str | None]:
+        """
+        CLI 引数から action を判定
+
+        Returns:
+            (action, error_message)
+            - action が判定できた場合: (action, None)
+            - 明示的に禁止する場合: (None, error_message)
+            - 不明なコマンドの場合: (None, None)
+        """
+        if len(args) < 1:
+            return None, None
 
         cmd = args[0]
-        subcmd = args[1]
+        subcmd = args[1] if len(args) > 1 else None
+
+        # api コマンド
+        if cmd == "api":
+            if subcmd == "graphql":
+                return None, "GraphQL API is not allowed via proxy. Use high-level commands (issue, pr, sub-issue) instead."
+            # REST API は後で対応、今は禁止
+            return None, "Direct API calls are not supported yet. Use high-level commands (issue, pr, sub-issue) instead."
+
+        if subcmd is None:
+            return None, None
 
         # sub-issue コマンド
         if cmd == "sub-issue":
@@ -794,23 +815,24 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 "remove": "subissues:remove",
                 "reorder": "subissues:reprioritize",
             }
-            return action_map.get(subcmd)
+            action = action_map.get(subcmd)
+            return (action, None) if action else (None, None)
 
         # issue コマンド
         if cmd == "issue":
             if subcmd in ["list", "view"]:
-                return "issues:read"
+                return "issues:read", None
             elif subcmd in ["create", "edit", "close", "reopen", "comment"]:
-                return "issues:write"
+                return "issues:write", None
 
         # pr コマンド
         if cmd == "pr":
             if subcmd in ["list", "view", "diff", "checks"]:
-                return "pr:list"  # 簡易マッピング
+                return "pr:list", None
             elif subcmd in ["create", "edit", "close", "merge", "comment"]:
-                return "pr:create"  # 簡易マッピング
+                return "pr:create", None
 
-        return None
+        return None, None
 
     def handle_git_request(self, method: str):
         """git smart HTTP protocol のリクエスト処理"""
