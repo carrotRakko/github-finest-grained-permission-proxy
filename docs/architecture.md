@@ -120,10 +120,10 @@ REST API または GraphQL API（fine-grained PAT で認証）
 
 ---
 
-## 未実装
+## 実装状況
 
-- [ ] `/cli` エンドポイント（fgp）
-- [ ] `/cli` での高レベルコマンド → action マッピング
-- [ ] `/cli` での GraphQL ポリシー評価
-- [ ] fgh のカスタムコマンド対応（プロキシ対象外の場合：砕いて gh）
-- [ ] fgh のカスタムコマンド対応（プロキシ対象の場合：fgp `/cli`）
+- [x] `/cli` エンドポイント（fgp）
+- [ ] `/cli` での高レベルコマンド → action マッピング（cli_args_to_action）
+- [ ] `/cli` での GraphQL ポリシー評価（evaluate_policy）
+- [x] fgh のカスタムコマンド対応（プロキシ対象外の場合：gh 直接実行）
+- [x] fgh のカスタムコマンド対応（プロキシ対象の場合：fgp `/cli`）
