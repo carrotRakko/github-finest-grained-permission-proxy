@@ -151,6 +151,152 @@ call_proxy() {
     esac
 }
 
+# issue 番号から node ID を取得
+get_issue_node_id() {
+    local owner="$1"
+    local repo="$2"
+    local issue_number="$3"
+
+    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $number) { id }
+      }
+    }' -f owner="$owner" -f repo="$repo" -F number="$issue_number" --jq '.data.repository.issue.id'
+}
+
+# sub-issues 一覧を取得
+subissue_list() {
+    local owner="$1"
+    local repo="$2"
+    local issue_number="$3"
+
+    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $number) {
+          subIssues(first: 50) {
+            nodes { number title state }
+          }
+        }
+      }
+    }' -f owner="$owner" -f repo="$repo" -F number="$issue_number" --jq '.data.repository.issue.subIssues.nodes[] | "\(.number)\t\(.state)\t\(.title)"'
+}
+
+# sub-issue を追加
+subissue_add() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+
+    local parent_id child_id
+    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
+    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
+
+    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+    mutation($parentId: ID!, $childId: ID!) {
+      addSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+        issue { number title }
+        subIssue { number title }
+      }
+    }' -f parentId="$parent_id" -f childId="$child_id" --jq '
+      "Added #\(.data.addSubIssue.subIssue.number) (\(.data.addSubIssue.subIssue.title)) as sub-issue of #\(.data.addSubIssue.issue.number) (\(.data.addSubIssue.issue.title))"'
+}
+
+# sub-issue を削除
+subissue_remove() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+
+    local parent_id child_id
+    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
+    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
+
+    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+    mutation($parentId: ID!, $childId: ID!) {
+      removeSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+        issue { number title }
+        subIssue { number title }
+      }
+    }' -f parentId="$parent_id" -f childId="$child_id" --jq '
+      "Removed #\(.data.removeSubIssue.subIssue.number) (\(.data.removeSubIssue.subIssue.title)) from #\(.data.removeSubIssue.issue.number) (\(.data.removeSubIssue.issue.title))"'
+}
+
+# subissue コマンドのメイン
+handle_subissue() {
+    local action="$1"
+    shift
+
+    # repo を取得
+    local repo
+    repo=$(get_repo_from_args "$@")
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_git)
+    fi
+
+    if [[ -z "$repo" ]]; then
+        echo "Error: Could not determine repository. Use -R owner/repo" >&2
+        return 1
+    fi
+
+    local owner="${repo%%/*}"
+    local reponame="${repo##*/}"
+
+    # -R を除いた引数を取得
+    local args=()
+    local skip_next=false
+    for arg in "$@"; do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+        if [[ "$arg" == "-R" || "$arg" == "--repo" ]]; then
+            skip_next=true
+            continue
+        fi
+        if [[ "$arg" =~ ^-R || "$arg" =~ ^--repo= ]]; then
+            continue
+        fi
+        args+=("$arg")
+    done
+
+    case "$action" in
+        list)
+            local issue_number="${args[0]}"
+            if [[ -z "$issue_number" ]]; then
+                echo "Usage: fgh subissue list <issue_number> [-R owner/repo]" >&2
+                return 1
+            fi
+            subissue_list "$owner" "$reponame" "$issue_number"
+            ;;
+        add)
+            local parent="${args[0]}"
+            local child="${args[1]}"
+            if [[ -z "$parent" || -z "$child" ]]; then
+                echo "Usage: fgh subissue add <parent_number> <child_number> [-R owner/repo]" >&2
+                return 1
+            fi
+            subissue_add "$owner" "$reponame" "$parent" "$child"
+            ;;
+        remove)
+            local parent="${args[0]}"
+            local child="${args[1]}"
+            if [[ -z "$parent" || -z "$child" ]]; then
+                echo "Usage: fgh subissue remove <parent_number> <child_number> [-R owner/repo]" >&2
+                return 1
+            fi
+            subissue_remove "$owner" "$reponame" "$parent" "$child"
+            ;;
+        *)
+            echo "Usage: fgh subissue <list|add|remove> ..." >&2
+            return 1
+            ;;
+    esac
+}
+
 # メイン
 main() {
     if [[ $# -eq 0 ]]; then
@@ -159,6 +305,13 @@ main() {
     fi
 
     local subcommand="$1"
+
+    # subissue コマンド
+    if [[ "$subcommand" == "subissue" ]]; then
+        shift
+        handle_subissue "$@"
+        return
+    fi
 
     # api サブコマンドは特別扱い
     if [[ "$subcommand" == "api" ]]; then
