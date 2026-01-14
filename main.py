@@ -239,6 +239,7 @@ ALL_ACTIONS = [
     "issues:read", "issues:write",
     "git:read", "git:write",
     "discussions:write",
+    "subissues:add", "subissues:remove", "subissues:reprioritize",
 ] + PR_LAYER1_ACTIONS
 
 # カテゴリごとのアクション（ワイルドカード展開用）
@@ -251,6 +252,7 @@ ACTION_CATEGORIES = {
     "pr": PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
     "discussions": ["discussions:write"],
+    "subissues": ["subissues:add", "subissues:remove", "subissues:reprioritize"],
 }
 
 
@@ -567,6 +569,8 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.handle_git_request(method)
         elif path == "/graphql":
             self.handle_graphql_request(method)
+        elif path.startswith("/graphql-ops/sub-issues/"):
+            self.handle_sub_issues_request(method, path)
         else:
             self.handle_api_request(method)
 
@@ -736,6 +740,232 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         with urlopen(req, timeout=30) as response:
             response_headers = {k: v for k, v in response.headers.items()}
             return response.read(), response_headers
+
+    # =========================================================================
+    # Sub-Issues GraphQL Operations
+    # =========================================================================
+
+    def handle_sub_issues_request(self, method: str, path: str):
+        """Sub-issues GraphQL operations の REST 風エンドポイント"""
+        if method != "POST":
+            self.send_error(405, "Only POST is allowed")
+            return
+
+        # リクエストボディの読み取り
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self.send_error(400, "Request body required")
+            return
+
+        body = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON in request body")
+            return
+
+        # 必須パラメータの検証
+        owner = data.get("owner")
+        repo = data.get("repo")
+        issue_number = data.get("issue_number")
+        sub_issue_number = data.get("sub_issue_number")
+
+        if not owner or not repo:
+            self.send_error(400, "owner and repo are required")
+            return
+
+        full_repo = f"{owner}/{repo}"
+
+        # オペレーション判定
+        if path == "/graphql-ops/sub-issues/add":
+            action = "subissues:add"
+        elif path == "/graphql-ops/sub-issues/remove":
+            action = "subissues:remove"
+        elif path == "/graphql-ops/sub-issues/reprioritize":
+            action = "subissues:reprioritize"
+        else:
+            self.send_error(404, f"Unknown sub-issues operation: {path}")
+            return
+
+        # ポリシー評価
+        allowed, reason = evaluate_policy(action, full_repo, self.config["rules"])
+        if not allowed:
+            self.send_error(403, reason)
+            return
+
+        # オペレーション実行
+        try:
+            if action == "subissues:add":
+                if not issue_number or not sub_issue_number:
+                    self.send_error(400, "issue_number and sub_issue_number are required")
+                    return
+                result = self.execute_add_sub_issue(
+                    owner, repo, issue_number, sub_issue_number,
+                    replace_parent=data.get("replace_parent", False)
+                )
+            elif action == "subissues:remove":
+                if not issue_number or not sub_issue_number:
+                    self.send_error(400, "issue_number and sub_issue_number are required")
+                    return
+                result = self.execute_remove_sub_issue(owner, repo, issue_number, sub_issue_number)
+            elif action == "subissues:reprioritize":
+                if not issue_number or not sub_issue_number:
+                    self.send_error(400, "issue_number and sub_issue_number are required")
+                    return
+                result = self.execute_reprioritize_sub_issue(
+                    owner, repo, issue_number, sub_issue_number,
+                    before_number=data.get("before_number"),
+                    after_number=data.get("after_number")
+                )
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
+
+        except HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            self.send_error(e.code, f"{e.reason}: {error_body[:200]}")
+        except URLError as e:
+            self.send_error(502, f"Failed to connect to GitHub: {e.reason}")
+        except ValueError as e:
+            self.send_error(400, str(e))
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def get_issue_node_id(self, owner: str, repo: str, issue_number: int) -> str:
+        """Issue の Node ID を取得"""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                issue(number: $number) {
+                    id
+                }
+            }
+        }
+        """
+        variables = {"owner": owner, "repo": repo, "number": issue_number}
+        result = self.execute_graphql(query, variables)
+
+        issue = result.get("data", {}).get("repository", {}).get("issue")
+        if not issue:
+            raise ValueError(f"Issue #{issue_number} not found in {owner}/{repo}")
+        return issue["id"]
+
+    def execute_graphql(self, query: str, variables: dict = None) -> dict:
+        """GraphQL クエリを実行"""
+        url = "https://api.github.com/graphql"
+
+        body = {"query": query}
+        if variables:
+            body["variables"] = variables
+
+        headers = {
+            "Authorization": f"bearer {self.config['classic_pat']}",
+            "Content-Type": "application/json",
+            "User-Agent": "github-proxy/1.0",
+        }
+
+        req = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+
+        with urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if "errors" in result:
+                raise ValueError(f"GraphQL error: {result['errors']}")
+            return result
+
+    def execute_add_sub_issue(
+        self, owner: str, repo: str, issue_number: int, sub_issue_number: int,
+        replace_parent: bool = False
+    ) -> dict:
+        """addSubIssue mutation を実行"""
+        issue_id = self.get_issue_node_id(owner, repo, issue_number)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+
+        mutation = """
+        mutation($issueId: ID!, $subIssueId: ID!, $replaceParent: Boolean) {
+            addSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId, replaceParent: $replaceParent}) {
+                issue { number }
+                subIssue { number }
+            }
+        }
+        """
+        variables = {
+            "issueId": issue_id,
+            "subIssueId": sub_issue_id,
+            "replaceParent": replace_parent
+        }
+        result = self.execute_graphql(mutation, variables)
+
+        return {
+            "success": True,
+            "issue_number": issue_number,
+            "sub_issue_number": sub_issue_number
+        }
+
+    def execute_remove_sub_issue(
+        self, owner: str, repo: str, issue_number: int, sub_issue_number: int
+    ) -> dict:
+        """removeSubIssue mutation を実行"""
+        issue_id = self.get_issue_node_id(owner, repo, issue_number)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+
+        mutation = """
+        mutation($issueId: ID!, $subIssueId: ID!) {
+            removeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId}) {
+                issue { number }
+                subIssue { number }
+            }
+        }
+        """
+        variables = {"issueId": issue_id, "subIssueId": sub_issue_id}
+        result = self.execute_graphql(mutation, variables)
+
+        return {
+            "success": True,
+            "issue_number": issue_number,
+            "sub_issue_number": sub_issue_number
+        }
+
+    def execute_reprioritize_sub_issue(
+        self, owner: str, repo: str, issue_number: int, sub_issue_number: int,
+        before_number: int = None, after_number: int = None
+    ) -> dict:
+        """reprioritizeSubIssue mutation を実行"""
+        issue_id = self.get_issue_node_id(owner, repo, issue_number)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+
+        before_id = None
+        after_id = None
+        if before_number:
+            before_id = self.get_issue_node_id(owner, repo, before_number)
+        if after_number:
+            after_id = self.get_issue_node_id(owner, repo, after_number)
+
+        mutation = """
+        mutation($issueId: ID!, $subIssueId: ID!, $beforeId: ID, $afterId: ID) {
+            reprioritizeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId, beforeId: $beforeId, afterId: $afterId}) {
+                issue { number }
+            }
+        }
+        """
+        variables = {
+            "issueId": issue_id,
+            "subIssueId": sub_issue_id,
+            "beforeId": before_id,
+            "afterId": after_id
+        }
+        result = self.execute_graphql(mutation, variables)
+
+        return {
+            "success": True,
+            "issue_number": issue_number,
+            "sub_issue_number": sub_issue_number,
+            "before_number": before_number,
+            "after_number": after_number
+        }
 
     def handle_api_request(self, method: str):
         """GitHub API リクエスト処理"""
