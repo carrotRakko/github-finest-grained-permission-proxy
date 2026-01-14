@@ -109,15 +109,31 @@ POST /cli
 
 ### 許可されるコマンド
 
-| コマンド | 対応 | 備考 |
-|---------|------|------|
-| `issue list/view/create/...` | ✓ | 高レベルコマンド |
-| `pr list/view/create/...` | ✓ | 高レベルコマンド |
-| `sub-issue list/add/...` | ✓ | カスタムコマンド |
-| `api graphql` | ✗ | **禁止**: ポリシー評価をバイパスできるため |
-| `api /repos/...` | ✗ | 未対応（将来検討） |
+| コマンド | action | 備考 |
+|---------|--------|------|
+| `issue list/view` | `issues:read` | |
+| `issue create/edit/close/...` | `issues:write` | |
+| `pr list/view/diff/checks` | `pr:read` | |
+| `pr create` | `pr:create` | |
+| `pr edit/close/reopen` | `pr:write` | |
+| `pr merge` | `pr:merge` | **deny 可能** |
+| `pr comment` | `pr:comment` | |
+| `pr review` | `pr:review` | |
+| `sub-issue list/add/...` | `subissues:*` | カスタムコマンド |
+| `api graphql` | - | **禁止** |
+| `api /repos/...` | - | **未対応** |
 
 **セキュリティ上の理由**: 直接 GraphQL/REST API を許可すると、`mergePullRequest` mutation などでポリシーをバイパスできてしまう。高レベルコマンドのみを許可し、fgp 側で action にマッピングしてポリシー評価を行う。
+
+**設定例（merge を禁止）:**
+```json
+{
+  "rules": [
+    { "effect": "allow", "actions": ["pr:*"], "repos": ["owner/repo"] },
+    { "effect": "deny", "actions": ["pr:merge"], "repos": ["*"] }
+  ]
+}
+```
 
 ---
 
