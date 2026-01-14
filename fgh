@@ -292,6 +292,33 @@ sub-issue_reorder() {
 # sub-issue コマンドのメイン
 handle_sub-issue() {
     local action="$1"
+
+    # 引数なしならヘルプ表示
+    if [[ -z "$action" ]]; then
+        cat <<'EOF'
+Work with GitHub sub-issues.
+
+USAGE
+  fgh sub-issue <command> [flags]
+
+COMMANDS
+  list:     List sub-issues of an issue
+  add:      Add a sub-issue to an issue
+  remove:   Remove a sub-issue from an issue
+  parent:   Show parent issue
+  reorder:  Reorder sub-issues
+
+FLAGS
+  -R, --repo <owner/repo>   Specify repository (default: from git remote)
+
+EXAMPLES
+  fgh sub-issue list 123
+  fgh sub-issue add 100 123
+  fgh sub-issue parent 123
+EOF
+        return 0
+    fi
+
     shift
 
     # repo を取得
@@ -353,7 +380,7 @@ handle_sub-issue() {
         list)
             local issue_number="${filtered_args[0]}"
             if [[ -z "$issue_number" ]]; then
-                echo "Usage: fgh sub-issue list <issue_number> [-R owner/repo]" >&2
+                echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
             sub-issue_list "$owner" "$reponame" "$issue_number"
@@ -361,8 +388,9 @@ handle_sub-issue() {
         add)
             local parent="${filtered_args[0]}"
             local child="${filtered_args[1]}"
-            if [[ -z "$parent" || -z "$child" ]]; then
-                echo "Usage: fgh sub-issue add <parent_number> <child_number> [-R owner/repo]" >&2
+            local received=${#filtered_args[@]}
+            if [[ $received -lt 2 ]]; then
+                echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
             sub-issue_add "$owner" "$reponame" "$parent" "$child"
@@ -370,8 +398,9 @@ handle_sub-issue() {
         remove)
             local parent="${filtered_args[0]}"
             local child="${filtered_args[1]}"
-            if [[ -z "$parent" || -z "$child" ]]; then
-                echo "Usage: fgh sub-issue remove <parent_number> <child_number> [-R owner/repo]" >&2
+            local received=${#filtered_args[@]}
+            if [[ $received -lt 2 ]]; then
+                echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
             sub-issue_remove "$owner" "$reponame" "$parent" "$child"
@@ -379,7 +408,7 @@ handle_sub-issue() {
         parent)
             local child="${filtered_args[0]}"
             if [[ -z "$child" ]]; then
-                echo "Usage: fgh sub-issue parent <child_number> [-R owner/repo]" >&2
+                echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
             sub-issue_parent "$owner" "$reponame" "$child"
@@ -387,19 +416,19 @@ handle_sub-issue() {
         reorder)
             local parent="${filtered_args[0]}"
             local child="${filtered_args[1]}"
-            if [[ -z "$parent" || -z "$child" ]]; then
-                echo "Usage: fgh sub-issue reorder <parent_number> <child_number> --before <sibling> [-R owner/repo]" >&2
+            local received=${#filtered_args[@]}
+            if [[ $received -lt 2 ]]; then
+                echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
             if [[ -z "$before_number" && -z "$after_number" ]]; then
-                echo "Usage: fgh sub-issue reorder <parent_number> <child_number> --before <sibling> [-R owner/repo]" >&2
-                echo "       fgh sub-issue reorder <parent_number> <child_number> --after <sibling> [-R owner/repo]" >&2
+                echo "required flag not set: --before or --after" >&2
                 return 1
             fi
             sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
             ;;
         *)
-            echo "Usage: fgh sub-issue <list|add|remove|parent|reorder> ..." >&2
+            echo "unknown command: $action" >&2
             return 1
             ;;
     esac
