@@ -59,24 +59,14 @@ call_proxy_cli() {
     shift
     local args=("$@")
 
-    # JSON 配列を構築
-    local args_json="["
-    local first=true
-    for arg in "${args[@]}"; do
-        if $first; then
-            first=false
-        else
-            args_json="$args_json,"
-        fi
-        # 引数をエスケープして JSON 文字列に
-        args_json="$args_json\"$(echo "$arg" | sed 's/"/\\"/g')\""
-    done
-    args_json="$args_json]"
+    # jq を使って安全に JSON を構築（NUL 区切りで改行を含む引数に対応）
+    local args_json
+    args_json=$(printf '%s\0' "${args[@]}" | jq -Rs 'split("\u0000") | map(select(length > 0))')
 
     local result
     result=$(curl -s -X POST "${FGP_PROXY_URL}/cli" \
         -H "Content-Type: application/json" \
-        -d "{\"args\":$args_json,\"repo\":\"$repo\"}")
+        -d "$(jq -n --argjson args "$args_json" --arg repo "$repo" '{args: $args, repo: $repo}')")
 
     # エラーチェック（HTML エラーページ）
     if echo "$result" | grep -q '<!DOCTYPE'; then
