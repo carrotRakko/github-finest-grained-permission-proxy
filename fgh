@@ -257,8 +257,30 @@ main() {
         return 1
     fi
 
+    # pr create の場合、--head を自動付与（fgp 側で origin 解決できないため）
+    local args=("$@")
+    if [[ "${args[0]}" == "pr" && "${args[1]}" == "create" ]]; then
+        # --head が既に指定されているかチェック
+        local has_head=false
+        for arg in "${args[@]}"; do
+            if [[ "$arg" == "--head" || "$arg" =~ ^--head= ]]; then
+                has_head=true
+                break
+            fi
+        done
+
+        if ! $has_head; then
+            local branch
+            branch=$(git branch --show-current 2>/dev/null)
+            if [[ -n "$branch" ]]; then
+                local owner="${repo%%/*}"
+                args+=("--head" "${owner}:${branch}")
+            fi
+        fi
+    fi
+
     # 全てのコマンドを fgp に転送
-    call_proxy_cli "$repo" "$@"
+    call_proxy_cli "$repo" "${args[@]}"
 }
 
 main "$@"
