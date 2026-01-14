@@ -166,7 +166,7 @@ get_issue_node_id() {
 }
 
 # sub-issues 一覧を取得
-subissue_list() {
+sub-issue_list() {
     local owner="$1"
     local repo="$2"
     local issue_number="$3"
@@ -184,7 +184,7 @@ subissue_list() {
 }
 
 # sub-issue を追加
-subissue_add() {
+sub-issue_add() {
     local owner="$1"
     local repo="$2"
     local parent_number="$3"
@@ -205,7 +205,7 @@ subissue_add() {
 }
 
 # sub-issue を削除
-subissue_remove() {
+sub-issue_remove() {
     local owner="$1"
     local repo="$2"
     local parent_number="$3"
@@ -225,8 +225,72 @@ subissue_remove() {
       "Removed #\(.data.removeSubIssue.subIssue.number) (\(.data.removeSubIssue.subIssue.title)) from #\(.data.removeSubIssue.issue.number) (\(.data.removeSubIssue.issue.title))"'
 }
 
-# subissue コマンドのメイン
-handle_subissue() {
+# 親 issue を取得
+sub-issue_parent() {
+    local owner="$1"
+    local repo="$2"
+    local child_number="$3"
+
+    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $number) {
+          parent { number title state }
+        }
+      }
+    }' -f owner="$owner" -f repo="$repo" -F number="$child_number" --jq '
+      if .data.repository.issue.parent then
+        "\(.data.repository.issue.parent.number)\t\(.data.repository.issue.parent.state)\t\(.data.repository.issue.parent.title)"
+      else
+        "No parent issue"
+      end'
+}
+
+# sub-issue の並び替え
+sub-issue_reorder() {
+    local owner="$1"
+    local repo="$2"
+    local parent_number="$3"
+    local child_number="$4"
+    local before_number="$5"
+    local after_number="$6"
+
+    local parent_id child_id
+    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
+    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
+
+    local before_id=""
+    local after_id=""
+    if [[ -n "$before_number" ]]; then
+        before_id=$(get_issue_node_id "$owner" "$repo" "$before_number")
+    fi
+    if [[ -n "$after_number" ]]; then
+        after_id=$(get_issue_node_id "$owner" "$repo" "$after_number")
+    fi
+
+    local query
+    if [[ -n "$before_id" ]]; then
+        gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+        mutation($parentId: ID!, $childId: ID!, $beforeId: ID!) {
+          reprioritizeSubIssue(input: { issueId: $parentId, subIssueId: $childId, beforeId: $beforeId }) {
+            issue { number }
+          }
+        }' -f parentId="$parent_id" -f childId="$child_id" -f beforeId="$before_id" --jq '"Reordered"'
+    elif [[ -n "$after_id" ]]; then
+        gh api graphql -H "GraphQL-Features: sub_issues" -f query='
+        mutation($parentId: ID!, $childId: ID!, $afterId: ID!) {
+          reprioritizeSubIssue(input: { issueId: $parentId, subIssueId: $childId, afterId: $afterId }) {
+            issue { number }
+          }
+        }' -f parentId="$parent_id" -f childId="$child_id" -f afterId="$after_id" --jq '"Reordered"'
+    else
+        echo "Error: --before or --after is required" >&2
+        return 1
+    fi
+}
+
+# sub-issue コマンドのメイン
+handle_sub-issue() {
     local action="$1"
     shift
 
@@ -263,35 +327,79 @@ handle_subissue() {
         args+=("$arg")
     done
 
+    # --before と --after オプションを取得
+    local before_number=""
+    local after_number=""
+    local -a filtered_args=()
+    local i=0
+    while [[ $i -lt ${#args[@]} ]]; do
+        case "${args[i]}" in
+            --before)
+                before_number="${args[i+1]}"
+                i=$((i + 2))
+                ;;
+            --after)
+                after_number="${args[i+1]}"
+                i=$((i + 2))
+                ;;
+            *)
+                filtered_args+=("${args[i]}")
+                i=$((i + 1))
+                ;;
+        esac
+    done
+
     case "$action" in
         list)
-            local issue_number="${args[0]}"
+            local issue_number="${filtered_args[0]}"
             if [[ -z "$issue_number" ]]; then
-                echo "Usage: fgh subissue list <issue_number> [-R owner/repo]" >&2
+                echo "Usage: fgh sub-issue list <issue_number> [-R owner/repo]" >&2
                 return 1
             fi
-            subissue_list "$owner" "$reponame" "$issue_number"
+            sub-issue_list "$owner" "$reponame" "$issue_number"
             ;;
         add)
-            local parent="${args[0]}"
-            local child="${args[1]}"
+            local parent="${filtered_args[0]}"
+            local child="${filtered_args[1]}"
             if [[ -z "$parent" || -z "$child" ]]; then
-                echo "Usage: fgh subissue add <parent_number> <child_number> [-R owner/repo]" >&2
+                echo "Usage: fgh sub-issue add <parent_number> <child_number> [-R owner/repo]" >&2
                 return 1
             fi
-            subissue_add "$owner" "$reponame" "$parent" "$child"
+            sub-issue_add "$owner" "$reponame" "$parent" "$child"
             ;;
         remove)
-            local parent="${args[0]}"
-            local child="${args[1]}"
+            local parent="${filtered_args[0]}"
+            local child="${filtered_args[1]}"
             if [[ -z "$parent" || -z "$child" ]]; then
-                echo "Usage: fgh subissue remove <parent_number> <child_number> [-R owner/repo]" >&2
+                echo "Usage: fgh sub-issue remove <parent_number> <child_number> [-R owner/repo]" >&2
                 return 1
             fi
-            subissue_remove "$owner" "$reponame" "$parent" "$child"
+            sub-issue_remove "$owner" "$reponame" "$parent" "$child"
+            ;;
+        parent)
+            local child="${filtered_args[0]}"
+            if [[ -z "$child" ]]; then
+                echo "Usage: fgh sub-issue parent <child_number> [-R owner/repo]" >&2
+                return 1
+            fi
+            sub-issue_parent "$owner" "$reponame" "$child"
+            ;;
+        reorder)
+            local parent="${filtered_args[0]}"
+            local child="${filtered_args[1]}"
+            if [[ -z "$parent" || -z "$child" ]]; then
+                echo "Usage: fgh sub-issue reorder <parent_number> <child_number> --before <sibling> [-R owner/repo]" >&2
+                return 1
+            fi
+            if [[ -z "$before_number" && -z "$after_number" ]]; then
+                echo "Usage: fgh sub-issue reorder <parent_number> <child_number> --before <sibling> [-R owner/repo]" >&2
+                echo "       fgh sub-issue reorder <parent_number> <child_number> --after <sibling> [-R owner/repo]" >&2
+                return 1
+            fi
+            sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
             ;;
         *)
-            echo "Usage: fgh subissue <list|add|remove> ..." >&2
+            echo "Usage: fgh sub-issue <list|add|remove|parent|reorder> ..." >&2
             return 1
             ;;
     esac
@@ -306,10 +414,10 @@ main() {
 
     local subcommand="$1"
 
-    # subissue コマンド
-    if [[ "$subcommand" == "subissue" ]]; then
+    # sub-issue コマンド
+    if [[ "$subcommand" == "sub-issue" ]]; then
         shift
-        handle_subissue "$@"
+        handle_sub-issue "$@"
         return
     fi
 
