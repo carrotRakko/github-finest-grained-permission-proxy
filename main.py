@@ -571,8 +571,32 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.handle_graphql_request(method)
         elif path.startswith("/graphql-ops/sub-issues/"):
             self.handle_sub_issues_request(method, path)
+        elif path == "/proxy-repos":
+            self.handle_proxy_repos_request(method)
         else:
             self.handle_api_request(method)
+
+    def handle_proxy_repos_request(self, method: str):
+        """プロキシ対象リポジトリ一覧を返す（fgh 用）"""
+        if method != "GET":
+            self.send_error(405, "Only GET is allowed")
+            return
+
+        # rules から allow されてるリポジトリを抽出
+        repos = set()
+        for rule in self.config.get("rules", []):
+            if rule.get("effect") == "allow":
+                for repo in rule.get("repos", []):
+                    if repo != "*" and not repo.endswith("/*"):
+                        repos.add(repo)
+
+        result = {"repos": sorted(repos)}
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode("utf-8"))
 
     def handle_git_request(self, method: str):
         """git smart HTTP protocol のリクエスト処理"""
