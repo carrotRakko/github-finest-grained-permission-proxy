@@ -21,109 +21,202 @@ fine-grained PAT は以下の repo にしか発行できない：
 ## コンポーネント
 
 ```
-ユーザー(AI) ---(1)---> fgh ---(2)---> fgp ---(3)---> GitHub
-                         |
-                         +---(4)---> gh ---(5)---> GitHub
+ユーザー(AI) ---> fgh ---> fgp ---> GitHub API
+                            |
+                            +---> gh (subprocess) ---> GitHub API
 ```
 
 | コンポーネント | どこで動く | 役割 |
 |---------------|-----------|------|
-| **fgh** | devcontainer | CLI。ルーター。プロキシ対象か判定して振り分ける |
-| **fgp** | ホスト | HTTP プロキシ。classic PAT を持ち、許可された操作だけ通す |
-| **gh** | devcontainer | GitHub 公式 CLI。fine-grained PAT で認証済み |
+| **fgh** | devcontainer | CLI。薄いクライアント。全リクエストを fgp に転送する |
+| **fgp** | ホスト | HTTP サーバー。PAT 管理、ポリシー評価、GitHub API 実行 |
+| **gh** | ホスト | GitHub 公式 CLI。fgp から subprocess で呼ばれる |
 
 ---
 
 ## fgh の責任
 
-**シンプルなルーターに徹する**
+**薄いクライアントに徹する**
 
-```
-fgh の判定:
-1. プロキシ対象 repo か？（fgp の /proxy-repos で取得）
-2. 対象 → fgp にパススルー
-3. 対象外 → gh にパススルー（カスタムコマンドは砕いて gh へ）
-```
+- 全てのコマンドを fgp の `/cli` エンドポイントに転送
+- ルーティング判断をしない（fgp に委ねる）
+- PAT を持たない
 
----
-
-## 矢印の整理
-
-### (1) ユーザー → fgh
-
-CLI コマンド:
 ```bash
-fgh issue list
+# fgh が受けたコマンド
+fgh issue list -R owner/repo
+fgh sub-issue list 123
 fgh api /repos/owner/repo/issues
-fgh api graphql -f query='...'
-fgh subissue add 123 456  # カスタム
-```
 
-### (2) fgh → fgp（プロキシ対象の場合）
-
-**CLI 形式を HTTP で送る**:
-```
+# 全て fgp の /cli に転送
 POST /cli
 {
-  "args": ["issue", "list", "--label", "bug"],
+  "args": ["issue", "list"],
   "repo": "owner/repo"
 }
 ```
-
-### (3) fgp → GitHub
-
-- ポリシー評価（allow/deny）
-- 許可されたら GitHub API を叩く（classic PAT で認証）
-
-### (4) fgh → gh（プロキシ対象外の場合）
-
-gh にそのままパススルー:
-```bash
-gh issue list
-gh api /repos/owner/repo/issues
-gh api graphql -f query='...'
-```
-
-カスタムコマンドは砕いて gh に送る:
-```bash
-# fgh subissue add 123 456
-# ↓ 砕いて
-gh api graphql ...  # node ID 取得
-gh api graphql ...  # node ID 取得
-gh api graphql ...  # addSubIssue mutation
-```
-
-### (5) gh → GitHub
-
-REST API または GraphQL API（fine-grained PAT で認証）
-
----
-
-## コマンド種別と処理フロー
-
-| 種別 | 例 | プロキシ対象 | プロキシ対象外 |
-|-----|-----|------------|--------------|
-| 高レベル | `fgh issue list` | fgp `/cli` | gh パススルー |
-| REST | `fgh api /repos/...` | fgp `/cli` | gh パススルー |
-| GraphQL | `fgh api graphql ...` | fgp `/cli` | gh パススルー |
-| カスタム | `fgh subissue add ...` | fgp `/cli` | 砕いて gh |
 
 ---
 
 ## fgp の責任
 
-1. `/proxy-repos` - プロキシ対象 repo 一覧を返す
-2. `/cli` - CLI コマンドを受け取り、GitHub API を叩く
-3. ポリシー評価 - allow/deny ルールに基づいてアクセス制御
-4. REST API プロキシ - `/repos/...` 等を GitHub に中継（従来互換）
-5. カスタム操作 - sub-issues 等は `/cli` 経由で `gh api graphql` として実行
+1. **PAT 管理** - classic PAT × 1 + fine-grained PAT × n を保持
+2. **PAT 選択** - repo に基づいて適切な PAT を選択
+3. **ポリシー評価** - action × repo でアクセス制御
+4. **コマンド実行** - gh subprocess または直接 GraphQL 実行
+
+### PAT 選択ロジック
+
+```
+1. repo にマッチする fine-grained PAT を探す
+2. マッチしたらそれを使う
+3. どれにもマッチしなければ classic PAT（fallback）
+```
+
+### 設定ファイル形式
+
+```json
+{
+  "classic_pat": "ghp_xxx",
+  "fine_grained_pats": [
+    {
+      "pat": "github_pat_delight_xxx",
+      "repos": ["delight-co/*"]
+    },
+    {
+      "pat": "github_pat_carrotRakko_xxx",
+      "repos": ["carrotRakko/*"]
+    }
+  ],
+  "rules": [
+    { "effect": "allow", "actions": ["*"], "repos": ["delight-co/*"] },
+    { "effect": "allow", "actions": ["subissues:*", "issues:*"], "repos": ["anthropic/claude-code"] },
+    { "effect": "deny", "actions": ["pr:merge_*"], "repos": ["*"] }
+  ]
+}
+```
+
+---
+
+## エンドポイント
+
+| エンドポイント | 用途 | クライアント |
+|---------------|------|-------------|
+| `/cli` | CLI コマンド実行 | fgh |
+| `/git/{owner}/{repo}.git/...` | git smart HTTP | git (clone/push) |
+
+`/cli` に一本化。fgh は `/cli` のみを叩く。
+
+### 許可されるコマンド
+
+| コマンド | action | 備考 |
+|---------|--------|------|
+| `issue list/view` | `issues:read` | |
+| `issue create/edit/close/...` | `issues:write` | |
+| `pr list/view/diff/checks` | `pr:read` | |
+| `pr create` | `pr:create` | |
+| `pr edit/close/reopen` | `pr:write` | |
+| `pr merge` | `pr:merge` | **deny 可能** |
+| `pr comment` | `pr:comment` | |
+| `pr review` | `pr:review` | |
+| `sub-issue list/add/...` | `subissues:*` | カスタムコマンド |
+| `api graphql` | - | **禁止** |
+| `api /repos/...` | - | **未対応** |
+
+**セキュリティ上の理由**: 直接 GraphQL/REST API を許可すると、`mergePullRequest` mutation などでポリシーをバイパスできてしまう。高レベルコマンドのみを許可し、fgp 側で action にマッピングしてポリシー評価を行う。
+
+**設定例（merge を禁止）:**
+```json
+{
+  "rules": [
+    { "effect": "allow", "actions": ["pr:*"], "repos": ["owner/repo"] },
+    { "effect": "deny", "actions": ["pr:merge"], "repos": ["*"] }
+  ]
+}
+```
+
+---
+
+## コマンド実行フロー
+
+### 標準 gh コマンド
+
+```
+fgh issue list -R delight-co/repo
+  ↓
+fgp /cli: ["issue", "list"]
+  ↓
+PAT 選択: delight-co/* → fine-grained PAT
+  ↓
+ポリシー評価: issues:read × delight-co/repo → Allow
+  ↓
+gh issue list -R delight-co/repo (subprocess, 選択した PAT で)
+  ↓
+結果を fgh に返す
+```
+
+### カスタムコマンド (sub-issue 等)
+
+```
+fgh sub-issue list 123 -R carrotRakko/terachess
+  ↓
+fgp /cli: ["sub-issue", "list", "123"]
+  ↓
+PAT 選択: carrotRakko/* → fine-grained PAT (or classic if not found)
+  ↓
+ポリシー評価: subissues:list × carrotRakko/terachess → Allow
+  ↓
+GraphQL 実行 (選択した PAT で)
+  ↓
+結果を fgh に返す
+```
+
+---
+
+## 進化の計画
+
+### Phase 1: GraphQL 直実装（現在）
+
+カスタムコマンド（sub-issue, discussions 等）は fgp 内で GraphQL を直接実行。
+
+```
+fgp
+  └── execute_sub_issue_cli()  # GraphQL 直叩き
+  └── execute_discussions_cli()  # GraphQL 直叩き
+```
+
+### Phase 2: gh extension 化（将来）
+
+カスタムコマンドを gh extension として切り出し、fgp は subprocess で呼ぶ。
+
+```
+fgp
+  └── gh sub-issue (extension)
+  └── gh discussions (extension)
+```
+
+**メリット**:
+- gh extension として個別に「召し抱えられ」を狙える
+- fgp はポリシー評価に専念
+
+---
+
+## 召し抱えられ戦略との関係
+
+2層の召し抱えられポイント:
+
+1. **fgp のポリシー設計** - action × repo、層1/層2 の粒度設計
+   - GitHub が「こういう権限分離が必要」と気づくリファレンス
+
+2. **gh extension** - sub-issue, discussions, project-v2 等
+   - gh 公式コマンドとして取り込まれる可能性
 
 ---
 
 ## 実装状況
 
 - [x] `/cli` エンドポイント（fgp）
-- [ ] `/cli` での高レベルコマンド → action マッピング（cli_args_to_action）
-- [ ] `/cli` での GraphQL ポリシー評価（evaluate_policy）
-- [x] fgh のカスタムコマンド対応（プロキシ対象外の場合：gh 直接実行）
-- [x] fgh のカスタムコマンド対応（プロキシ対象の場合：fgp `/cli`）
+- [x] fgh を薄いクライアント化（全コマンドを /cli に転送）
+- [x] PAT 選択ロジック（fine-grained × n + classic fallback）
+- [x] 旧エンドポイント削除（/proxy-repos, /graphql-ops/sub-issues/*）
+- [x] fgh から sub-issue 実装を削除（fgp に一元化）

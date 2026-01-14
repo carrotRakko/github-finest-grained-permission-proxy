@@ -240,6 +240,8 @@ ALL_ACTIONS = [
     "git:read", "git:write",
     "discussions:write",
     "subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize",
+    # 高レベル PR action（cli_args_to_action 用）
+    "pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review",
 ] + PR_LAYER1_ACTIONS
 
 # カテゴリごとのアクション（ワイルドカード展開用）
@@ -249,7 +251,7 @@ ACTION_CATEGORIES = {
     "statuses": ["statuses:read"],
     "code": ["code:read", "code:write"],
     "issues": ["issues:read", "issues:write"],
-    "pr": PR_LAYER1_ACTIONS,
+    "pr": ["pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review"] + PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
     "discussions": ["discussions:write"],
     "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
@@ -483,6 +485,27 @@ def match_git_endpoint(method: str, path: str, query: str) -> tuple[str | None, 
 
 
 # =============================================================================
+# PAT 選択
+# =============================================================================
+
+def select_pat(repo: str, config: dict) -> str:
+    """
+    リポジトリに基づいて適切な PAT を選択する
+
+    1. repo にマッチする fine-grained PAT を探す
+    2. マッチしたらそれを使う
+    3. どれにもマッチしなければ classic PAT（fallback）
+    """
+    for fg_pat in config.get("fine_grained_pats", []):
+        for repo_pattern in fg_pat.get("repos", []):
+            if expand_repo_pattern(repo_pattern, repo):
+                return fg_pat["pat"]
+
+    # fallback to classic PAT
+    return config["classic_pat"]
+
+
+# =============================================================================
 # 設定ファイル
 # =============================================================================
 
@@ -495,9 +518,12 @@ def load_config(config_path: Path) -> dict:
         print(f"  cat > {config_path} << 'EOF'", file=sys.stderr)
         print("""{
   "classic_pat": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "fine_grained_pats": [
+    { "pat": "github_pat_xxx", "repos": ["owner/*"] }
+  ],
   "rules": [
     { "effect": "allow", "actions": ["*"], "repos": ["owner/repo"] },
-    { "effect": "deny", "actions": ["pulls:merge"], "repos": ["*"] }
+    { "effect": "deny", "actions": ["pr:merge_*"], "repos": ["*"] }
   ]
 }
 EOF""", file=sys.stderr)
@@ -529,6 +555,21 @@ EOF""", file=sys.stderr)
     if not isinstance(config["rules"], list) or len(config["rules"]) == 0:
         print("Error: rules must be a non-empty list", file=sys.stderr)
         sys.exit(1)
+
+    # fine_grained_pats のバリデーション（オプショナル）
+    if "fine_grained_pats" in config:
+        if not isinstance(config["fine_grained_pats"], list):
+            print("Error: fine_grained_pats must be a list", file=sys.stderr)
+            sys.exit(1)
+        for i, fg_pat in enumerate(config["fine_grained_pats"]):
+            if "pat" not in fg_pat:
+                print(f"Error: fine_grained_pats[{i}] missing 'pat'", file=sys.stderr)
+                sys.exit(1)
+            if "repos" not in fg_pat or not isinstance(fg_pat["repos"], list):
+                print(f"Error: fine_grained_pats[{i}] missing or invalid 'repos'", file=sys.stderr)
+                sys.exit(1)
+    else:
+        config["fine_grained_pats"] = []
 
     # ルールのバリデーション
     for i, rule in enumerate(config["rules"]):
@@ -567,38 +608,10 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/git/"):
             self.handle_git_request(method)
-        elif path == "/graphql":
-            self.handle_graphql_request(method)
-        elif path.startswith("/graphql-ops/sub-issues/"):
-            self.handle_sub_issues_request(method, path)
         elif path == "/cli":
             self.handle_cli_request(method)
-        elif path == "/proxy-repos":
-            self.handle_proxy_repos_request(method)
         else:
-            self.handle_api_request(method)
-
-    def handle_proxy_repos_request(self, method: str):
-        """プロキシ対象リポジトリ一覧を返す（fgh 用）"""
-        if method != "GET":
-            self.send_error(405, "Only GET is allowed")
-            return
-
-        # rules から allow されてるリポジトリを抽出
-        repos = set()
-        for rule in self.config.get("rules", []):
-            if rule.get("effect") == "allow":
-                for repo in rule.get("repos", []):
-                    if repo != "*" and not repo.endswith("/*"):
-                        repos.add(repo)
-
-        result = {"repos": sorted(repos)}
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode("utf-8"))
+            self.send_error(404, f"Unknown endpoint: {path}")
 
     def handle_cli_request(self, method: str):
         """CLI コマンドを受け取って gh を実行する（fgh 用）"""
@@ -632,9 +645,12 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             return
 
         # コマンドから action を判定
-        action = self.cli_args_to_action(args)
+        action, error_message = self.cli_args_to_action(args)
         if action is None:
-            self.send_error(403, f"Unknown or unsupported command: {args}")
+            if error_message:
+                self.send_error(403, error_message)
+            else:
+                self.send_error(403, f"Unknown or unsupported command: {args}")
             return
 
         # ポリシー評価
@@ -643,6 +659,9 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(403, reason)
             return
 
+        # PAT 選択
+        pat = select_pat(repo, self.config)
+
         # コマンド実行
         try:
             cmd = args[0]
@@ -650,10 +669,10 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
             # sub-issue コマンドは GraphQL で実行（gh にはないカスタムコマンド）
             if cmd == "sub-issue":
-                result = self.execute_sub_issue_cli(args[1:], owner, repo_name)
+                result = self.execute_sub_issue_cli(args[1:], owner, repo_name, pat)
             else:
                 # 標準の gh コマンドは subprocess で実行
-                result = self.execute_gh_cli(args, repo)
+                result = self.execute_gh_cli(args, repo, pat)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -666,7 +685,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
-    def execute_gh_cli(self, args: list[str], repo: str) -> dict:
+    def execute_gh_cli(self, args: list[str], repo: str, pat: str) -> dict:
         """標準の gh コマンドを subprocess で実行"""
         import subprocess
         import os
@@ -680,7 +699,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             timeout=60,
             env={
                 **os.environ,
-                "GH_TOKEN": self.config["classic_pat"]
+                "GH_TOKEN": pat
             }
         )
 
@@ -690,7 +709,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "stderr": result.stderr
         }
 
-    def execute_sub_issue_cli(self, args: list[str], owner: str, repo: str) -> dict:
+    def execute_sub_issue_cli(self, args: list[str], owner: str, repo: str, pat: str) -> dict:
         """sub-issue コマンドを GraphQL で実行"""
         if not args:
             raise ValueError("sub-issue subcommand required")
@@ -702,7 +721,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             if not rest:
                 raise ValueError("issue number required")
             issue_number = int(rest[0])
-            result = self.execute_list_sub_issues(owner, repo, issue_number)
+            result = self.execute_list_sub_issues(owner, repo, issue_number, pat)
             # stdout 形式に変換
             lines = []
             for item in result.get("sub_issues", []):
@@ -713,7 +732,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             if not rest:
                 raise ValueError("issue number required")
             issue_number = int(rest[0])
-            result = self.execute_get_parent_issue(owner, repo, issue_number)
+            result = self.execute_get_parent_issue(owner, repo, issue_number, pat)
             parent = result.get("parent")
             if parent:
                 stdout = f"{parent['number']}\t{parent['state']}\t{parent['title']}"
@@ -726,7 +745,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("parent and child issue numbers required")
             parent_number = int(rest[0])
             child_number = int(rest[1])
-            self.execute_add_sub_issue(owner, repo, parent_number, child_number)
+            self.execute_add_sub_issue(owner, repo, parent_number, child_number, pat)
             return {"exit_code": 0, "stdout": f"Added #{child_number} as sub-issue of #{parent_number}", "stderr": ""}
 
         elif subcmd == "remove":
@@ -734,7 +753,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("parent and child issue numbers required")
             parent_number = int(rest[0])
             child_number = int(rest[1])
-            self.execute_remove_sub_issue(owner, repo, parent_number, child_number)
+            self.execute_remove_sub_issue(owner, repo, parent_number, child_number, pat)
             return {"exit_code": 0, "stdout": f"Removed #{child_number} from #{parent_number}", "stderr": ""}
 
         elif subcmd == "reorder":
@@ -757,19 +776,37 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                     i += 1
             if not before_number and not after_number:
                 raise ValueError("--before or --after required")
-            self.execute_reprioritize_sub_issue(owner, repo, parent_number, child_number, before_number, after_number)
+            self.execute_reprioritize_sub_issue(owner, repo, parent_number, child_number, before_number, after_number, pat)
             return {"exit_code": 0, "stdout": "Reordered", "stderr": ""}
 
         else:
             raise ValueError(f"Unknown sub-issue subcommand: {subcmd}")
 
-    def cli_args_to_action(self, args: list[str]) -> str | None:
-        """CLI 引数から action を判定"""
-        if len(args) < 2:
-            return None
+    def cli_args_to_action(self, args: list[str]) -> tuple[str | None, str | None]:
+        """
+        CLI 引数から action を判定
+
+        Returns:
+            (action, error_message)
+            - action が判定できた場合: (action, None)
+            - 明示的に禁止する場合: (None, error_message)
+            - 不明なコマンドの場合: (None, None)
+        """
+        if len(args) < 1:
+            return None, None
 
         cmd = args[0]
-        subcmd = args[1]
+        subcmd = args[1] if len(args) > 1 else None
+
+        # api コマンド
+        if cmd == "api":
+            if subcmd == "graphql":
+                return None, "GraphQL API is not allowed via proxy. Use high-level commands (issue, pr, sub-issue) instead."
+            # REST API は後で対応、今は禁止
+            return None, "Direct API calls are not supported yet. Use high-level commands (issue, pr, sub-issue) instead."
+
+        if subcmd is None:
+            return None, None
 
         # sub-issue コマンド
         if cmd == "sub-issue":
@@ -780,23 +817,32 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 "remove": "subissues:remove",
                 "reorder": "subissues:reprioritize",
             }
-            return action_map.get(subcmd)
+            action = action_map.get(subcmd)
+            return (action, None) if action else (None, None)
 
         # issue コマンド
         if cmd == "issue":
             if subcmd in ["list", "view"]:
-                return "issues:read"
+                return "issues:read", None
             elif subcmd in ["create", "edit", "close", "reopen", "comment"]:
-                return "issues:write"
+                return "issues:write", None
 
         # pr コマンド
         if cmd == "pr":
             if subcmd in ["list", "view", "diff", "checks"]:
-                return "pr:list"  # 簡易マッピング
-            elif subcmd in ["create", "edit", "close", "merge", "comment"]:
-                return "pr:create"  # 簡易マッピング
+                return "pr:read", None
+            elif subcmd in ["create"]:
+                return "pr:create", None
+            elif subcmd in ["edit", "close", "reopen"]:
+                return "pr:write", None
+            elif subcmd == "merge":
+                return "pr:merge", None
+            elif subcmd in ["comment"]:
+                return "pr:comment", None
+            elif subcmd in ["review"]:
+                return "pr:review", None
 
-        return None
+        return None, None
 
     def handle_git_request(self, method: str):
         """git smart HTTP protocol のリクエスト処理"""
@@ -879,201 +925,11 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             response_headers = {k: v for k, v in response.headers.items()}
             return response.read(), response_headers, response.status
 
-    def handle_graphql_request(self, method: str):
-        """GraphQL リクエスト処理"""
-        if method != "POST":
-            self.send_error(405, "GraphQL only supports POST")
-            return
-
-        # リクエストボディの読み取り
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self.send_error(400, "Request body required")
-            return
-
-        body = self.rfile.read(content_length)
-
-        try:
-            body_json = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON in request body")
-            return
-
-        query = body_json.get("query", "")
-
-        # mutation 名を抽出
-        mutation_match = re.search(r"mutation\s*\{?\s*(\w+)", query)
-        if not mutation_match:
-            self.send_error(403, "Only mutations are supported via proxy")
-            return
-
-        mutation_name = mutation_match.group(1)
-
-        # mutation → action マッピング
-        action = GRAPHQL_MUTATION_ACTIONS.get(mutation_name)
-        if action is None:
-            self.send_error(403, f"Mutation not allowed: {mutation_name}")
-            return
-
-        # GraphQL の場合、リポジトリは config の graphql_repos から取得
-        graphql_repos = self.config.get("graphql_repos", [])
-        if not graphql_repos:
-            self.send_error(403, "No graphql_repos configured")
-            return
-
-        # いずれかの repo で許可されているかチェック
-        allowed = False
-        for repo in graphql_repos:
-            is_allowed, reason = evaluate_policy(action, repo, self.config["rules"])
-            if is_allowed:
-                allowed = True
-                break
-
-        if not allowed:
-            self.send_error(403, f"Action {action} not allowed on any graphql_repos")
-            return
-
-        # GitHub GraphQL API にプロキシ
-        try:
-            response_data, response_headers = self.proxy_graphql_to_github(body)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(response_data)
-        except HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            self.send_error(e.code, f"{e.reason}: {error_body[:200]}")
-        except URLError as e:
-            self.send_error(502, f"Failed to connect to GitHub: {e.reason}")
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    def proxy_graphql_to_github(self, body: bytes) -> tuple[bytes, dict]:
-        """GitHub GraphQL API にプロキシ"""
-        url = "https://api.github.com/graphql"
-
-        headers = {
-            "Authorization": f"bearer {self.config['classic_pat']}",
-            "Content-Type": "application/json",
-            "User-Agent": "github-proxy/1.0",
-        }
-
-        req = Request(url, data=body, headers=headers, method="POST")
-
-        with urlopen(req, timeout=30) as response:
-            response_headers = {k: v for k, v in response.headers.items()}
-            return response.read(), response_headers
-
     # =========================================================================
-    # Sub-Issues GraphQL Operations
+    # Sub-Issues GraphQL Operations (internal use by /cli)
     # =========================================================================
 
-    def handle_sub_issues_request(self, method: str, path: str):
-        """Sub-issues GraphQL operations の REST 風エンドポイント"""
-        if method != "POST":
-            self.send_error(405, "Only POST is allowed")
-            return
-
-        # リクエストボディの読み取り
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self.send_error(400, "Request body required")
-            return
-
-        body = self.rfile.read(content_length)
-
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON in request body")
-            return
-
-        # 必須パラメータの検証
-        owner = data.get("owner")
-        repo = data.get("repo")
-        issue_number = data.get("issue_number")
-        sub_issue_number = data.get("sub_issue_number")
-
-        if not owner or not repo:
-            self.send_error(400, "owner and repo are required")
-            return
-
-        full_repo = f"{owner}/{repo}"
-
-        # オペレーション判定
-        if path == "/graphql-ops/sub-issues/list":
-            action = "subissues:list"
-        elif path == "/graphql-ops/sub-issues/parent":
-            action = "subissues:parent"
-        elif path == "/graphql-ops/sub-issues/add":
-            action = "subissues:add"
-        elif path == "/graphql-ops/sub-issues/remove":
-            action = "subissues:remove"
-        elif path == "/graphql-ops/sub-issues/reprioritize":
-            action = "subissues:reprioritize"
-        else:
-            self.send_error(404, f"Unknown sub-issues operation: {path}")
-            return
-
-        # ポリシー評価
-        allowed, reason = evaluate_policy(action, full_repo, self.config["rules"])
-        if not allowed:
-            self.send_error(403, reason)
-            return
-
-        # オペレーション実行
-        try:
-            if action == "subissues:list":
-                if not issue_number:
-                    self.send_error(400, "issue_number is required")
-                    return
-                result = self.execute_list_sub_issues(owner, repo, issue_number)
-            elif action == "subissues:parent":
-                if not issue_number:
-                    self.send_error(400, "issue_number is required")
-                    return
-                result = self.execute_get_parent_issue(owner, repo, issue_number)
-            elif action == "subissues:add":
-                if not issue_number or not sub_issue_number:
-                    self.send_error(400, "issue_number and sub_issue_number are required")
-                    return
-                result = self.execute_add_sub_issue(
-                    owner, repo, issue_number, sub_issue_number,
-                    replace_parent=data.get("replace_parent", False)
-                )
-            elif action == "subissues:remove":
-                if not issue_number or not sub_issue_number:
-                    self.send_error(400, "issue_number and sub_issue_number are required")
-                    return
-                result = self.execute_remove_sub_issue(owner, repo, issue_number, sub_issue_number)
-            elif action == "subissues:reprioritize":
-                if not issue_number or not sub_issue_number:
-                    self.send_error(400, "issue_number and sub_issue_number are required")
-                    return
-                result = self.execute_reprioritize_sub_issue(
-                    owner, repo, issue_number, sub_issue_number,
-                    before_number=data.get("before_number"),
-                    after_number=data.get("after_number")
-                )
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode("utf-8"))
-
-        except HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            self.send_error(e.code, f"{e.reason}: {error_body[:200]}")
-        except URLError as e:
-            self.send_error(502, f"Failed to connect to GitHub: {e.reason}")
-        except ValueError as e:
-            self.send_error(400, str(e))
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    def get_issue_node_id(self, owner: str, repo: str, issue_number: int) -> str:
+    def get_issue_node_id(self, owner: str, repo: str, issue_number: int, pat: str) -> str:
         """Issue の Node ID を取得"""
         query = """
         query($owner: String!, $repo: String!, $number: Int!) {
@@ -1085,14 +941,14 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         }
         """
         variables = {"owner": owner, "repo": repo, "number": issue_number}
-        result = self.execute_graphql(query, variables)
+        result = self.execute_graphql(query, variables, pat)
 
         issue = result.get("data", {}).get("repository", {}).get("issue")
         if not issue:
             raise ValueError(f"Issue #{issue_number} not found in {owner}/{repo}")
         return issue["id"]
 
-    def execute_graphql(self, query: str, variables: dict = None) -> dict:
+    def execute_graphql(self, query: str, variables: dict, pat: str) -> dict:
         """GraphQL クエリを実行"""
         url = "https://api.github.com/graphql"
 
@@ -1101,7 +957,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             body["variables"] = variables
 
         headers = {
-            "Authorization": f"bearer {self.config['classic_pat']}",
+            "Authorization": f"bearer {pat}",
             "Content-Type": "application/json",
             "User-Agent": "github-proxy/1.0",
             "GraphQL-Features": "sub_issues",
@@ -1115,7 +971,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError(f"GraphQL error: {result['errors']}")
             return result
 
-    def execute_list_sub_issues(self, owner: str, repo: str, issue_number: int) -> dict:
+    def execute_list_sub_issues(self, owner: str, repo: str, issue_number: int, pat: str) -> dict:
         """Issue の sub-issues 一覧を取得"""
         query = """
         query($owner: String!, $repo: String!, $number: Int!) {
@@ -1133,7 +989,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         }
         """
         variables = {"owner": owner, "repo": repo, "number": issue_number}
-        result = self.execute_graphql(query, variables)
+        result = self.execute_graphql(query, variables, pat)
 
         issue = result.get("data", {}).get("repository", {}).get("issue")
         if not issue:
@@ -1142,7 +998,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         sub_issues = issue.get("subIssues", {}).get("nodes", [])
         return {"sub_issues": sub_issues}
 
-    def execute_get_parent_issue(self, owner: str, repo: str, issue_number: int) -> dict:
+    def execute_get_parent_issue(self, owner: str, repo: str, issue_number: int, pat: str) -> dict:
         """Issue の親 issue を取得"""
         query = """
         query($owner: String!, $repo: String!, $number: Int!) {
@@ -1158,7 +1014,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         }
         """
         variables = {"owner": owner, "repo": repo, "number": issue_number}
-        result = self.execute_graphql(query, variables)
+        result = self.execute_graphql(query, variables, pat)
 
         issue = result.get("data", {}).get("repository", {}).get("issue")
         if not issue:
@@ -1168,12 +1024,12 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         return {"parent": parent}
 
     def execute_add_sub_issue(
-        self, owner: str, repo: str, issue_number: int, sub_issue_number: int,
+        self, owner: str, repo: str, issue_number: int, sub_issue_number: int, pat: str,
         replace_parent: bool = False
     ) -> dict:
         """addSubIssue mutation を実行"""
-        issue_id = self.get_issue_node_id(owner, repo, issue_number)
-        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+        issue_id = self.get_issue_node_id(owner, repo, issue_number, pat)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number, pat)
 
         mutation = """
         mutation($issueId: ID!, $subIssueId: ID!, $replaceParent: Boolean) {
@@ -1188,7 +1044,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "subIssueId": sub_issue_id,
             "replaceParent": replace_parent
         }
-        result = self.execute_graphql(mutation, variables)
+        result = self.execute_graphql(mutation, variables, pat)
 
         return {
             "success": True,
@@ -1197,11 +1053,11 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         }
 
     def execute_remove_sub_issue(
-        self, owner: str, repo: str, issue_number: int, sub_issue_number: int
+        self, owner: str, repo: str, issue_number: int, sub_issue_number: int, pat: str
     ) -> dict:
         """removeSubIssue mutation を実行"""
-        issue_id = self.get_issue_node_id(owner, repo, issue_number)
-        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+        issue_id = self.get_issue_node_id(owner, repo, issue_number, pat)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number, pat)
 
         mutation = """
         mutation($issueId: ID!, $subIssueId: ID!) {
@@ -1212,7 +1068,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         }
         """
         variables = {"issueId": issue_id, "subIssueId": sub_issue_id}
-        result = self.execute_graphql(mutation, variables)
+        result = self.execute_graphql(mutation, variables, pat)
 
         return {
             "success": True,
@@ -1222,18 +1078,18 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
     def execute_reprioritize_sub_issue(
         self, owner: str, repo: str, issue_number: int, sub_issue_number: int,
-        before_number: int = None, after_number: int = None
+        before_number: int, after_number: int, pat: str
     ) -> dict:
         """reprioritizeSubIssue mutation を実行"""
-        issue_id = self.get_issue_node_id(owner, repo, issue_number)
-        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number)
+        issue_id = self.get_issue_node_id(owner, repo, issue_number, pat)
+        sub_issue_id = self.get_issue_node_id(owner, repo, sub_issue_number, pat)
 
         before_id = None
         after_id = None
         if before_number:
-            before_id = self.get_issue_node_id(owner, repo, before_number)
+            before_id = self.get_issue_node_id(owner, repo, before_number, pat)
         if after_number:
-            after_id = self.get_issue_node_id(owner, repo, after_number)
+            after_id = self.get_issue_node_id(owner, repo, after_number, pat)
 
         mutation = """
         mutation($issueId: ID!, $subIssueId: ID!, $beforeId: ID, $afterId: ID) {
@@ -1248,7 +1104,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "beforeId": before_id,
             "afterId": after_id
         }
-        result = self.execute_graphql(mutation, variables)
+        result = self.execute_graphql(mutation, variables, pat)
 
         return {
             "success": True,
@@ -1257,81 +1113,6 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "before_number": before_number,
             "after_number": after_number
         }
-
-    def handle_api_request(self, method: str):
-        """GitHub API リクエスト処理"""
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parsed.query
-
-        # エンドポイントマッチング
-        action, groups = match_endpoint(method, path)
-        if action is None:
-            self.send_error(403, f"Endpoint not allowed: {method} {path}")
-            return
-
-        # リポジトリ取得
-        owner = groups.get("owner")
-        repo = groups.get("repo")
-        if not owner or not repo:
-            self.send_error(400, "Could not determine repository")
-            return
-
-        full_repo = f"{owner}/{repo}"
-
-        # リクエストボディの読み取り（パラメータ分岐で必要）
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
-
-        # パラメータ分岐（_PARAM_BRANCH を解決）
-        action = resolve_param_branch(action, body)
-
-        # ポリシー評価
-        allowed, reason = evaluate_policy(action, full_repo, self.config["rules"])
-        if not allowed:
-            self.send_error(403, reason)
-            return
-
-        # GitHub API にプロキシ
-        try:
-            response_data, response_headers = self.proxy_to_github(method, path, query, body)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            for header in ["X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"]:
-                if header in response_headers:
-                    self.send_header(header, response_headers[header])
-            self.end_headers()
-            self.wfile.write(response_data)
-        except HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            self.send_error(e.code, f"{e.reason}: {error_body[:200]}")
-        except URLError as e:
-            self.send_error(502, f"Failed to connect to GitHub: {e.reason}")
-        except Exception as e:
-            self.send_error(500, str(e))
-
-    def proxy_to_github(self, method: str, path: str, query: str, body: bytes | None) -> tuple[bytes, dict]:
-        """GitHub API にプロキシ"""
-        url = f"https://api.github.com{path}"
-        if query:
-            url += f"?{query}"
-
-        headers = {
-            "Authorization": f"token {self.config['classic_pat']}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "github-proxy/1.0",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-
-        if body:
-            headers["Content-Type"] = "application/json"
-
-        req = Request(url, data=body, headers=headers, method=method)
-
-        with urlopen(req, timeout=30) as response:
-            response_headers = {k: v for k, v in response.headers.items()}
-            return response.read(), response_headers
 
     def do_GET(self):
         self.route_request("GET")
