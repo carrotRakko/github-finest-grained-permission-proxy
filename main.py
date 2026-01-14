@@ -240,6 +240,8 @@ ALL_ACTIONS = [
     "git:read", "git:write",
     "discussions:write",
     "subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize",
+    # 高レベル PR action（cli_args_to_action 用）
+    "pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review",
 ] + PR_LAYER1_ACTIONS
 
 # カテゴリごとのアクション（ワイルドカード展開用）
@@ -249,7 +251,7 @@ ACTION_CATEGORIES = {
     "statuses": ["statuses:read"],
     "code": ["code:read", "code:write"],
     "issues": ["issues:read", "issues:write"],
-    "pr": PR_LAYER1_ACTIONS,
+    "pr": ["pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review"] + PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
     "discussions": ["discussions:write"],
     "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
@@ -828,9 +830,17 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         # pr コマンド
         if cmd == "pr":
             if subcmd in ["list", "view", "diff", "checks"]:
-                return "pr:list", None
-            elif subcmd in ["create", "edit", "close", "merge", "comment"]:
+                return "pr:read", None
+            elif subcmd in ["create"]:
                 return "pr:create", None
+            elif subcmd in ["edit", "close", "reopen"]:
+                return "pr:write", None
+            elif subcmd == "merge":
+                return "pr:merge", None
+            elif subcmd in ["comment"]:
+                return "pr:comment", None
+            elif subcmd in ["review"]:
+                return "pr:review", None
 
         return None, None
 
