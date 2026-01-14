@@ -87,6 +87,10 @@ call_proxy_cli() {
         return "$exit_code"
     fi
 
+    # gh outputs success messages to stderr (UNIX convention)
+    if [[ -n "$stderr" ]]; then
+        echo "$stderr" >&2
+    fi
     echo "$stdout"
 }
 
