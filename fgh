@@ -2,13 +2,12 @@
 #
 # fgh - finest-grained gh
 #
-# gh CLI のラッパー。プロキシ対象リポジトリはプロキシ経由で API を叩き、
-# それ以外は gh にパススルーする。
+# fgp プロキシの薄いクライアント。全てのコマンドを fgp の /cli エンドポイントに転送する。
 #
 # Usage:
 #   fgh issue list
 #   fgh pr view 123
-#   fgh api /repos/owner/repo/issues
+#   fgh sub-issue list 123
 #
 # Environment:
 #   FGP_PROXY_URL  - プロキシの URL (default: http://host.docker.internal:8766)
@@ -17,29 +16,6 @@
 set -e
 
 FGP_PROXY_URL="${FGP_PROXY_URL:-http://host.docker.internal:8766}"
-CACHE_FILE="/tmp/fgh-proxy-repos-$$"
-CACHE_TTL=300  # 5 minutes
-
-# プロキシ対象リポジトリを取得（キャッシュ付き）
-get_proxy_repos() {
-    # キャッシュが有効ならそれを使う
-    if [[ -f "$CACHE_FILE" ]]; then
-        local age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null)))
-        if [[ $age -lt $CACHE_TTL ]]; then
-            cat "$CACHE_FILE"
-            return
-        fi
-    fi
-
-    # プロキシから取得
-    local repos
-    repos=$(curl -s "${FGP_PROXY_URL}/proxy-repos" 2>/dev/null | jq -r '.repos[]' 2>/dev/null) || true
-
-    if [[ -n "$repos" ]]; then
-        echo "$repos" > "$CACHE_FILE"
-        echo "$repos"
-    fi
-}
 
 # git remote から owner/repo を取得
 get_repo_from_git() {
@@ -71,222 +47,6 @@ get_repo_from_args() {
             return
         fi
     done
-}
-
-# リポジトリがプロキシ対象か判定
-is_proxy_target() {
-    local repo="$1"
-    local proxy_repos
-    proxy_repos=$(get_proxy_repos)
-
-    # case-insensitive で比較
-    echo "$proxy_repos" | grep -iq "^${repo}$"
-}
-
-# gh サブコマンドを API エンドポイントに変換
-# 引数: repo subcommand action [args...]
-gh_to_api() {
-    local repo="$1"
-    local subcommand="$2"
-    local action="$3"
-    shift 3
-
-    case "$subcommand" in
-        issue)
-            case "$action" in
-                list)
-                    echo "GET" "/repos/${repo}/issues"
-                    ;;
-                view)
-                    local num="$1"
-                    echo "GET" "/repos/${repo}/issues/${num}"
-                    ;;
-                create)
-                    echo "POST" "/repos/${repo}/issues"
-                    ;;
-                *)
-                    return 1
-                    ;;
-            esac
-            ;;
-        pr)
-            case "$action" in
-                list)
-                    echo "GET" "/repos/${repo}/pulls"
-                    ;;
-                view)
-                    local num="$1"
-                    echo "GET" "/repos/${repo}/pulls/${num}"
-                    ;;
-                create)
-                    echo "POST" "/repos/${repo}/pulls"
-                    ;;
-                *)
-                    return 1
-                    ;;
-            esac
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# プロキシ経由で API を叩く
-call_proxy() {
-    local method="$1"
-    local path="$2"
-    shift 2
-
-    local url="${FGP_PROXY_URL}${path}"
-
-    case "$method" in
-        GET)
-            curl -s "$url"
-            ;;
-        POST|PUT|PATCH|DELETE)
-            # 残りの引数から body を構築（簡易実装）
-            curl -s -X "$method" -H "Content-Type: application/json" "$url" "$@"
-            ;;
-    esac
-}
-
-# issue 番号から node ID を取得
-get_issue_node_id() {
-    local owner="$1"
-    local repo="$2"
-    local issue_number="$3"
-
-    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-    query($owner: String!, $repo: String!, $number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        issue(number: $number) { id }
-      }
-    }' -f owner="$owner" -f repo="$repo" -F number="$issue_number" --jq '.data.repository.issue.id'
-}
-
-# sub-issues 一覧を取得
-sub-issue_list() {
-    local owner="$1"
-    local repo="$2"
-    local issue_number="$3"
-
-    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-    query($owner: String!, $repo: String!, $number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        issue(number: $number) {
-          subIssues(first: 50) {
-            nodes { number title state }
-          }
-        }
-      }
-    }' -f owner="$owner" -f repo="$repo" -F number="$issue_number" --jq '.data.repository.issue.subIssues.nodes[] | "\(.number)\t\(.state)\t\(.title)"'
-}
-
-# sub-issue を追加
-sub-issue_add() {
-    local owner="$1"
-    local repo="$2"
-    local parent_number="$3"
-    local child_number="$4"
-
-    local parent_id child_id
-    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
-    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
-
-    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-    mutation($parentId: ID!, $childId: ID!) {
-      addSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
-        issue { number title }
-        subIssue { number title }
-      }
-    }' -f parentId="$parent_id" -f childId="$child_id" --jq '
-      "Added #\(.data.addSubIssue.subIssue.number) (\(.data.addSubIssue.subIssue.title)) as sub-issue of #\(.data.addSubIssue.issue.number) (\(.data.addSubIssue.issue.title))"'
-}
-
-# sub-issue を削除
-sub-issue_remove() {
-    local owner="$1"
-    local repo="$2"
-    local parent_number="$3"
-    local child_number="$4"
-
-    local parent_id child_id
-    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
-    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
-
-    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-    mutation($parentId: ID!, $childId: ID!) {
-      removeSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
-        issue { number title }
-        subIssue { number title }
-      }
-    }' -f parentId="$parent_id" -f childId="$child_id" --jq '
-      "Removed #\(.data.removeSubIssue.subIssue.number) (\(.data.removeSubIssue.subIssue.title)) from #\(.data.removeSubIssue.issue.number) (\(.data.removeSubIssue.issue.title))"'
-}
-
-# 親 issue を取得
-sub-issue_parent() {
-    local owner="$1"
-    local repo="$2"
-    local child_number="$3"
-
-    gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-    query($owner: String!, $repo: String!, $number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        issue(number: $number) {
-          parent { number title state }
-        }
-      }
-    }' -f owner="$owner" -f repo="$repo" -F number="$child_number" --jq '
-      if .data.repository.issue.parent then
-        "\(.data.repository.issue.parent.number)\t\(.data.repository.issue.parent.state)\t\(.data.repository.issue.parent.title)"
-      else
-        "No parent issue"
-      end'
-}
-
-# sub-issue の並び替え
-sub-issue_reorder() {
-    local owner="$1"
-    local repo="$2"
-    local parent_number="$3"
-    local child_number="$4"
-    local before_number="$5"
-    local after_number="$6"
-
-    local parent_id child_id
-    parent_id=$(get_issue_node_id "$owner" "$repo" "$parent_number")
-    child_id=$(get_issue_node_id "$owner" "$repo" "$child_number")
-
-    local before_id=""
-    local after_id=""
-    if [[ -n "$before_number" ]]; then
-        before_id=$(get_issue_node_id "$owner" "$repo" "$before_number")
-    fi
-    if [[ -n "$after_number" ]]; then
-        after_id=$(get_issue_node_id "$owner" "$repo" "$after_number")
-    fi
-
-    local query
-    if [[ -n "$before_id" ]]; then
-        gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-        mutation($parentId: ID!, $childId: ID!, $beforeId: ID!) {
-          reprioritizeSubIssue(input: { issueId: $parentId, subIssueId: $childId, beforeId: $beforeId }) {
-            issue { number }
-          }
-        }' -f parentId="$parent_id" -f childId="$child_id" -f beforeId="$before_id" --jq '"Reordered"'
-    elif [[ -n "$after_id" ]]; then
-        gh api graphql -H "GraphQL-Features: sub_issues" -f query='
-        mutation($parentId: ID!, $childId: ID!, $afterId: ID!) {
-          reprioritizeSubIssue(input: { issueId: $parentId, subIssueId: $childId, afterId: $afterId }) {
-            issue { number }
-          }
-        }' -f parentId="$parent_id" -f childId="$child_id" -f afterId="$after_id" --jq '"Reordered"'
-    else
-        echo "Error: --before or --after is required" >&2
-        return 1
-    fi
 }
 
 # =============================================================================
@@ -340,13 +100,9 @@ call_proxy_cli() {
     echo "$stdout"
 }
 
-# sub-issue コマンドのメイン
-handle_sub-issue() {
-    local action="$1"
-
-    # 引数なしならヘルプ表示
-    if [[ -z "$action" ]]; then
-        cat <<'EOF'
+# sub-issue コマンドのヘルプ
+show_sub_issue_help() {
+    cat <<'EOF'
 Work with GitHub sub-issues.
 
 USAGE
@@ -367,6 +123,15 @@ EXAMPLES
   fgh sub-issue add 100 123
   fgh sub-issue parent 123
 EOF
+}
+
+# sub-issue コマンドのメイン
+handle_sub_issue() {
+    local action="$1"
+
+    # 引数なしならヘルプ表示
+    if [[ -z "$action" ]]; then
+        show_sub_issue_help
         return 0
     fi
 
@@ -383,9 +148,6 @@ EOF
         echo "Error: Could not determine repository. Use -R owner/repo" >&2
         return 1
     fi
-
-    local owner="${repo%%/*}"
-    local reponame="${repo##*/}"
 
     # -R を除いた引数を取得
     local args=()
@@ -405,107 +167,60 @@ EOF
         args+=("$arg")
     done
 
-    # --before と --after オプションを取得
-    local before_number=""
-    local after_number=""
-    local -a filtered_args=()
-    local i=0
-    while [[ $i -lt ${#args[@]} ]]; do
-        case "${args[i]}" in
-            --before)
-                before_number="${args[i+1]}"
-                i=$((i + 2))
-                ;;
-            --after)
-                after_number="${args[i+1]}"
-                i=$((i + 2))
-                ;;
-            *)
-                filtered_args+=("${args[i]}")
-                i=$((i + 1))
-                ;;
-        esac
-    done
-
-    # プロキシ対象かどうか判定
-    local use_proxy=false
-    if is_proxy_target "$repo"; then
-        use_proxy=true
-    fi
-
+    # 引数バリデーションとプロキシ呼び出し
     case "$action" in
         list)
-            local issue_number="${filtered_args[0]}"
+            local issue_number="${args[0]}"
             if [[ -z "$issue_number" ]]; then
                 echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
-            if $use_proxy; then
-                call_proxy_cli "$repo" "sub-issue" "list" "$issue_number"
-            else
-                sub-issue_list "$owner" "$reponame" "$issue_number"
-            fi
+            call_proxy_cli "$repo" "sub-issue" "list" "$issue_number"
             ;;
         add)
-            local parent="${filtered_args[0]}"
-            local child="${filtered_args[1]}"
-            local received=${#filtered_args[@]}
+            local parent="${args[0]}"
+            local child="${args[1]}"
+            local received=${#args[@]}
             if [[ $received -lt 2 ]]; then
                 echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
-            if $use_proxy; then
-                call_proxy_cli "$repo" "sub-issue" "add" "$parent" "$child"
-            else
-                sub-issue_add "$owner" "$reponame" "$parent" "$child"
-            fi
+            call_proxy_cli "$repo" "sub-issue" "add" "$parent" "$child"
             ;;
         remove)
-            local parent="${filtered_args[0]}"
-            local child="${filtered_args[1]}"
-            local received=${#filtered_args[@]}
+            local parent="${args[0]}"
+            local child="${args[1]}"
+            local received=${#args[@]}
             if [[ $received -lt 2 ]]; then
                 echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
-            if $use_proxy; then
-                call_proxy_cli "$repo" "sub-issue" "remove" "$parent" "$child"
-            else
-                sub-issue_remove "$owner" "$reponame" "$parent" "$child"
-            fi
+            call_proxy_cli "$repo" "sub-issue" "remove" "$parent" "$child"
             ;;
         parent)
-            local child="${filtered_args[0]}"
+            local child="${args[0]}"
             if [[ -z "$child" ]]; then
                 echo "accepts 1 arg(s), received 0" >&2
                 return 1
             fi
-            if $use_proxy; then
-                call_proxy_cli "$repo" "sub-issue" "parent" "$child"
-            else
-                sub-issue_parent "$owner" "$reponame" "$child"
-            fi
+            call_proxy_cli "$repo" "sub-issue" "parent" "$child"
             ;;
         reorder)
-            local parent="${filtered_args[0]}"
-            local child="${filtered_args[1]}"
-            local received=${#filtered_args[@]}
+            local parent="${args[0]}"
+            local child="${args[1]}"
+            local received=${#args[@]}
             if [[ $received -lt 2 ]]; then
                 echo "accepts 2 arg(s), received $received" >&2
                 return 1
             fi
-            if [[ -z "$before_number" && -z "$after_number" ]]; then
-                echo "required flag not set: --before or --after" >&2
-                return 1
-            fi
-            if $use_proxy; then
-                local reorder_args=("sub-issue" "reorder" "$parent" "$child")
-                [[ -n "$before_number" ]] && reorder_args+=("--before" "$before_number")
-                [[ -n "$after_number" ]] && reorder_args+=("--after" "$after_number")
-                call_proxy_cli "$repo" "${reorder_args[@]}"
-            else
-                sub-issue_reorder "$owner" "$reponame" "$parent" "$child" "$before_number" "$after_number"
-            fi
+            # --before/--after を探して proxy に渡す
+            local reorder_args=("sub-issue" "reorder" "$parent" "$child")
+            local i=2
+            while [[ $i -lt ${#args[@]} ]]; do
+                reorder_args+=("${args[i]}")
+                i=$((i + 1))
+            done
+            call_proxy_cli "$repo" "${reorder_args[@]}"
             ;;
         *)
             echo "unknown command: $action" >&2
@@ -517,32 +232,26 @@ EOF
 # メイン
 main() {
     if [[ $# -eq 0 ]]; then
-        gh
-        return
+        echo "fgh - finest-grained gh"
+        echo ""
+        echo "Usage: fgh <command> [args...]"
+        echo ""
+        echo "Commands:"
+        echo "  issue       Work with issues"
+        echo "  pr          Work with pull requests"
+        echo "  sub-issue   Work with sub-issues"
+        echo "  api         Make API requests"
+        echo ""
+        echo "All commands are forwarded to fgp proxy."
+        return 0
     fi
 
     local subcommand="$1"
 
-    # sub-issue コマンド
+    # sub-issue コマンドは特別扱い（引数バリデーション + ヘルプ）
     if [[ "$subcommand" == "sub-issue" ]]; then
         shift
-        handle_sub-issue "$@"
-        return
-    fi
-
-    # api サブコマンドは特別扱い
-    if [[ "$subcommand" == "api" ]]; then
-        shift
-        local path="$1"
-        # path から repo を抽出
-        if [[ "$path" =~ ^/repos/([^/]+/[^/]+) ]]; then
-            local repo="${BASH_REMATCH[1]}"
-            if is_proxy_target "$repo"; then
-                call_proxy "GET" "$path"
-                return
-            fi
-        fi
-        gh api "$@"
+        handle_sub_issue "$@"
         return
     fi
 
@@ -553,22 +262,13 @@ main() {
         repo=$(get_repo_from_git)
     fi
 
-    # リポジトリが特定できない、またはプロキシ対象外なら gh にパススルー
-    if [[ -z "$repo" ]] || ! is_proxy_target "$repo"; then
-        gh "$@"
-        return
+    if [[ -z "$repo" ]]; then
+        echo "Error: Could not determine repository. Use -R owner/repo" >&2
+        return 1
     fi
 
-    # プロキシ経由で API を叩く
-    local api_info
-    api_info=$(gh_to_api "$repo" "$@" 2>/dev/null) || {
-        # 変換できないコマンドは gh にパススルー
-        gh "$@"
-        return
-    }
-
-    read -r method path extra <<< "$api_info"
-    call_proxy "$method" "$path"
+    # 全てのコマンドを fgp に転送
+    call_proxy_cli "$repo" "$@"
 }
 
 main "$@"
