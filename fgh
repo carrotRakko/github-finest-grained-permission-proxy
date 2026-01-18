@@ -96,6 +96,124 @@ call_proxy_cli() {
     fi
 }
 
+# =============================================================================
+# auth コマンド
+# =============================================================================
+
+show_auth_help() {
+    cat <<'EOF'
+Display authentication status for fgp proxy.
+
+USAGE
+  fgh auth <command>
+
+COMMANDS
+  status:     Show authentication status for all PATs
+
+EXAMPLES
+  fgh auth status
+EOF
+}
+
+handle_auth() {
+    local action="$1"
+
+    if [[ -z "$action" || "$action" == "--help" || "$action" == "-h" ]]; then
+        show_auth_help
+        return 0
+    fi
+
+    if [[ "$action" != "status" ]]; then
+        echo "Unknown command: $action" >&2
+        echo "Run 'fgh auth --help' for usage." >&2
+        return 1
+    fi
+
+    # Call /auth/status endpoint
+    local result
+    result=$(curl -s "${FGP_PROXY_URL}/auth/status")
+
+    if [[ -z "$result" ]]; then
+        echo "Error: Could not connect to fgp proxy at ${FGP_PROXY_URL}" >&2
+        return 1
+    fi
+
+    # Check for HTML error response
+    if echo "$result" | grep -q '<!DOCTYPE'; then
+        echo "Error: Proxy returned an error" >&2
+        return 1
+    fi
+
+    # Format and display the result
+    echo ""
+    echo "Classic PAT:"
+    local classic_valid
+    classic_valid=$(echo "$result" | jq -r '.classic_pat.valid')
+    local classic_masked
+    classic_masked=$(echo "$result" | jq -r '.classic_pat.masked_token')
+    local classic_user
+    classic_user=$(echo "$result" | jq -r '.classic_pat.user // empty')
+
+    if [[ "$classic_valid" == "true" ]]; then
+        echo "  ✓ Valid ($classic_masked)"
+        echo "    User: $classic_user"
+        local scopes
+        scopes=$(echo "$result" | jq -r '.classic_pat.scopes | join(", ")')
+        if [[ -n "$scopes" ]]; then
+            echo "    Scopes: $scopes"
+        fi
+    else
+        local error
+        error=$(echo "$result" | jq -r '.classic_pat.error // "Unknown error"')
+        echo "  ✗ Invalid ($classic_masked)"
+        echo "    Error: $error"
+    fi
+
+    # Fine-grained PATs
+    local fg_count
+    fg_count=$(echo "$result" | jq '.fine_grained_pats | length')
+
+    if [[ "$fg_count" -gt 0 ]]; then
+        echo ""
+        echo "Fine-grained PATs:"
+
+        for ((i=0; i<fg_count; i++)); do
+            local fg_valid
+            fg_valid=$(echo "$result" | jq -r ".fine_grained_pats[$i].valid")
+            local fg_masked
+            fg_masked=$(echo "$result" | jq -r ".fine_grained_pats[$i].masked_token")
+            local fg_repos
+            fg_repos=$(echo "$result" | jq -r ".fine_grained_pats[$i].repos | join(\", \")")
+
+            if [[ "$fg_valid" == "true" ]]; then
+                local fg_user
+                fg_user=$(echo "$result" | jq -r ".fine_grained_pats[$i].user // empty")
+                echo "  ✓ Valid ($fg_masked)"
+                if [[ -n "$fg_user" ]]; then
+                    echo "    User: $fg_user"
+                fi
+                if [[ -n "$fg_repos" ]]; then
+                    echo "    Repos: $fg_repos"
+                fi
+            else
+                local fg_error
+                fg_error=$(echo "$result" | jq -r ".fine_grained_pats[$i].error // \"Unknown error\"")
+                echo "  ✗ Invalid ($fg_masked)"
+                if [[ -n "$fg_repos" ]]; then
+                    echo "    Repos: $fg_repos"
+                fi
+                echo "    Error: $fg_error"
+            fi
+        done
+    fi
+
+    echo ""
+}
+
+# =============================================================================
+# sub-issue コマンド
+# =============================================================================
+
 # sub-issue コマンドのヘルプ
 show_sub_issue_help() {
     cat <<'EOF'
@@ -233,6 +351,7 @@ main() {
         echo "Usage: fgh <command> [args...]"
         echo ""
         echo "Commands:"
+        echo "  auth        Manage authentication state"
         echo "  issue       Work with issues"
         echo "  pr          Work with pull requests"
         echo "  sub-issue   Work with sub-issues"
@@ -243,6 +362,13 @@ main() {
     fi
 
     local subcommand="$1"
+
+    # auth コマンドは特別扱い（プロキシに直接問い合わせ）
+    if [[ "$subcommand" == "auth" ]]; then
+        shift
+        handle_auth "$@"
+        return
+    fi
 
     # sub-issue コマンドは特別扱い（引数バリデーション + ヘルプ）
     if [[ "$subcommand" == "sub-issue" ]]; then
