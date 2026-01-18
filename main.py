@@ -612,8 +612,103 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.handle_git_request(method)
         elif path == "/cli":
             self.handle_cli_request(method)
+        elif path == "/auth/status":
+            self.handle_auth_status(method)
         else:
             self.send_error(404, f"Unknown endpoint: {path}")
+
+    def handle_auth_status(self, method: str):
+        """Check authentication status for all configured PATs"""
+        if method != "GET":
+            self.send_error(405, "Only GET is allowed")
+            return
+
+        result = {
+            "classic_pat": self._check_pat_status(
+                self.config["classic_pat"],
+                pat_type="classic"
+            ),
+            "fine_grained_pats": [],
+        }
+
+        for fg_pat in self.config.get("fine_grained_pats", []):
+            status = self._check_pat_status(
+                fg_pat["pat"],
+                pat_type="fine_grained",
+                repos=fg_pat.get("repos", [])
+            )
+            result["fine_grained_pats"].append(status)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(result, indent=2).encode("utf-8"))
+
+    def _check_pat_status(
+        self, pat: str, pat_type: str, repos: list[str] | None = None
+    ) -> dict:
+        """Validate a PAT by calling GitHub API /user endpoint"""
+        # Mask the PAT for display (show first 4 and last 4 chars)
+        if len(pat) > 12:
+            masked = f"{pat[:4]}...{pat[-4:]}"
+        else:
+            masked = "****"
+
+        try:
+            req = Request(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"Bearer {pat}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "fgp-proxy",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+            with urlopen(req, timeout=10) as resp:
+                user_data = json.loads(resp.read().decode("utf-8"))
+                scopes = resp.headers.get("X-OAuth-Scopes", "")
+
+                result = {
+                    "valid": True,
+                    "masked_token": masked,
+                    "user": user_data.get("login"),
+                    "type": pat_type,
+                }
+
+                if pat_type == "classic":
+                    result["scopes"] = [s.strip() for s in scopes.split(",") if s.strip()]
+                else:
+                    # Fine-grained PAT
+                    result["repos"] = repos or []
+                    # Note: Fine-grained PAT expiration is not available via API
+
+                return result
+
+        except HTTPError as e:
+            return {
+                "valid": False,
+                "masked_token": masked,
+                "type": pat_type,
+                "error": f"HTTP {e.code}: {e.reason}",
+                "repos": repos if pat_type == "fine_grained" else None,
+            }
+        except URLError as e:
+            return {
+                "valid": False,
+                "masked_token": masked,
+                "type": pat_type,
+                "error": str(e.reason),
+                "repos": repos if pat_type == "fine_grained" else None,
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "masked_token": masked,
+                "type": pat_type,
+                "error": str(e),
+                "repos": repos if pat_type == "fine_grained" else None,
+            }
 
     def handle_cli_request(self, method: str):
         """CLI コマンドを受け取って gh を実行する（fgh 用）"""
