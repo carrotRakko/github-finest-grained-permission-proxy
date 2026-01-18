@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Tools
+
+`fgh` is in PATH. Use `fgh` instead of `gh` for GitHub operations.
+
 ## Language
 
 All external communication must be in English:
