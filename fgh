@@ -211,6 +211,86 @@ handle_auth() {
 }
 
 # =============================================================================
+# discussion コマンド
+# =============================================================================
+
+show_discussion_help() {
+    cat <<'EOF'
+Work with GitHub Discussions.
+
+USAGE
+  fgh discussion <command> [flags]
+
+COMMANDS
+  list:           List discussions in a repository
+  view:           View a discussion
+  create:         Create a new discussion
+  edit:           Edit a discussion
+  comment:        Add a comment to a discussion
+  comment edit:   Edit a discussion comment (by ID)
+
+FLAGS
+  -R, --repo <owner/repo>   Specify repository (default: from git remote)
+  -t, --title <text>        Title (for create/edit)
+  -b, --body <text>         Body text
+  -c, --category <name>     Category name (for create)
+  --reply-to <comment_id>   Reply to a comment (for comment)
+
+EXAMPLES
+  fgh discussion list
+  fgh discussion view 123
+  fgh discussion create --title "Feature request" --body "..." --category "Ideas"
+  fgh discussion edit 123 --body "Updated body"
+  fgh discussion comment 123 --body "My comment"
+  fgh discussion comment edit DC_xxx --body "Updated comment"
+EOF
+}
+
+handle_discussion() {
+    local action="$1"
+
+    if [[ -z "$action" || "$action" == "--help" || "$action" == "-h" ]]; then
+        show_discussion_help
+        return 0
+    fi
+
+    shift
+
+    # repo を取得
+    local repo
+    repo=$(get_repo_from_args "$@")
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_git)
+    fi
+
+    if [[ -z "$repo" ]]; then
+        echo "Error: Could not determine repository. Use -R owner/repo" >&2
+        return 1
+    fi
+
+    # -R を除いた引数を取得
+    local args=()
+    local skip_next=false
+    for arg in "$@"; do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+        if [[ "$arg" == "-R" || "$arg" == "--repo" ]]; then
+            skip_next=true
+            continue
+        fi
+        if [[ "$arg" =~ ^-R || "$arg" =~ ^--repo= ]]; then
+            continue
+        fi
+        args+=("$arg")
+    done
+
+    # プロキシに転送
+    call_proxy_cli "$repo" "discussion" "$action" "${args[@]}"
+}
+
+# =============================================================================
 # sub-issue コマンド
 # =============================================================================
 
@@ -352,6 +432,7 @@ main() {
         echo ""
         echo "Commands:"
         echo "  auth        Manage authentication state"
+        echo "  discussion  Work with discussions"
         echo "  issue       Work with issues"
         echo "  pr          Work with pull requests"
         echo "  sub-issue   Work with sub-issues"
@@ -367,6 +448,13 @@ main() {
     if [[ "$subcommand" == "auth" ]]; then
         shift
         handle_auth "$@"
+        return
+    fi
+
+    # discussion コマンドは特別扱い（GraphQL カスタムコマンド）
+    if [[ "$subcommand" == "discussion" ]]; then
+        shift
+        handle_discussion "$@"
         return
     fi
 
