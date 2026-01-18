@@ -255,7 +255,7 @@ ACTION_CATEGORIES = {
     "issues": ["issues:read", "issues:write"],
     "pr": ["pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review"] + PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
-    "discussions": ["discussions:write"],
+    "discussions": ["discussions:read", "discussions:write"],
     "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
 }
 
@@ -767,6 +767,9 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             # sub-issue コマンドは GraphQL で実行（gh にはないカスタムコマンド）
             if cmd == "sub-issue":
                 result = self.execute_sub_issue_cli(args[1:], owner, repo_name, pat)
+            # discussion コマンドも GraphQL で実行
+            elif cmd == "discussion":
+                result = self.execute_discussion_cli(args[1:], owner, repo_name, pat)
             else:
                 # 標準の gh コマンドは subprocess で実行
                 result = self.execute_gh_cli(args, repo, pat)
@@ -919,6 +922,13 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             }
             action = action_map.get(subcmd)
             return (action, None) if action else (None, None)
+
+        # discussion コマンド
+        if cmd == "discussion":
+            if subcmd in ["list", "view"]:
+                return "discussions:read", None
+            elif subcmd in ["create", "edit", "comment"]:
+                return "discussions:write", None
 
         # issue コマンド
         if cmd == "issue":
@@ -1221,6 +1231,384 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "sub_issue_number": sub_issue_number,
             "before_number": before_number,
             "after_number": after_number
+        }
+
+    # =========================================================================
+    # Discussion GraphQL Operations
+    # =========================================================================
+
+    def execute_discussion_cli(
+        self, args: list[str], owner: str, repo: str, pat: str
+    ) -> dict:
+        """discussion コマンドを GraphQL で実行"""
+        if not args:
+            raise ValueError("discussion subcommand required")
+
+        subcmd = args[0]
+        rest = args[1:]
+
+        if subcmd == "list":
+            return self.execute_list_discussions(owner, repo, pat)
+
+        elif subcmd == "view":
+            if not rest:
+                raise ValueError("discussion number required")
+            number = int(rest[0])
+            return self.execute_view_discussion(owner, repo, number, pat)
+
+        elif subcmd == "create":
+            # Parse --title, --body, --category
+            title = None
+            body = None
+            category = None
+            i = 0
+            while i < len(rest):
+                if rest[i] in ["--title", "-t"] and i + 1 < len(rest):
+                    title = rest[i + 1]
+                    i += 2
+                elif rest[i] in ["--body", "-b"] and i + 1 < len(rest):
+                    body = rest[i + 1]
+                    i += 2
+                elif rest[i] in ["--category", "-c"] and i + 1 < len(rest):
+                    category = rest[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            if not title:
+                raise ValueError("--title is required")
+            if not body:
+                raise ValueError("--body is required")
+            if not category:
+                raise ValueError("--category is required")
+            return self.execute_create_discussion(owner, repo, title, body, category, pat)
+
+        elif subcmd == "edit":
+            if not rest:
+                raise ValueError("discussion number required")
+            number = int(rest[0])
+            # Parse --title, --body
+            title = None
+            body = None
+            i = 1
+            while i < len(rest):
+                if rest[i] in ["--title", "-t"] and i + 1 < len(rest):
+                    title = rest[i + 1]
+                    i += 2
+                elif rest[i] in ["--body", "-b"] and i + 1 < len(rest):
+                    body = rest[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            if not title and not body:
+                raise ValueError("--title or --body is required")
+            return self.execute_update_discussion(owner, repo, number, title, body, pat)
+
+        elif subcmd == "comment":
+            if not rest:
+                raise ValueError("discussion number or 'edit' required")
+            # Check if it's "comment edit <comment_id>"
+            if rest[0] == "edit":
+                if len(rest) < 2:
+                    raise ValueError("comment_id required")
+                comment_id = rest[1]
+                # Parse --body
+                body = None
+                i = 2
+                while i < len(rest):
+                    if rest[i] in ["--body", "-b"] and i + 1 < len(rest):
+                        body = rest[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                if not body:
+                    raise ValueError("--body is required")
+                return self.execute_update_discussion_comment(comment_id, body, pat)
+            else:
+                # Add comment: comment <number> --body "..."
+                number = int(rest[0])
+                # Parse --body, --reply-to
+                body = None
+                reply_to = None
+                i = 1
+                while i < len(rest):
+                    if rest[i] in ["--body", "-b"] and i + 1 < len(rest):
+                        body = rest[i + 1]
+                        i += 2
+                    elif rest[i] == "--reply-to" and i + 1 < len(rest):
+                        reply_to = rest[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                if not body:
+                    raise ValueError("--body is required")
+                return self.execute_add_discussion_comment(owner, repo, number, body, reply_to, pat)
+
+        else:
+            raise ValueError(f"Unknown discussion subcommand: {subcmd}")
+
+    def get_repository_id(self, owner: str, repo: str, pat: str) -> str:
+        """リポジトリの node ID を取得"""
+        query = """
+        query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                id
+            }
+        }
+        """
+        result = self.execute_graphql(query, {"owner": owner, "repo": repo}, pat)
+        return result["data"]["repository"]["id"]
+
+    def get_discussion_category_id(
+        self, owner: str, repo: str, category_name: str, pat: str
+    ) -> str:
+        """Discussion カテゴリの node ID を取得"""
+        query = """
+        query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                discussionCategories(first: 100) {
+                    nodes {
+                        id
+                        name
+                        slug
+                    }
+                }
+            }
+        }
+        """
+        result = self.execute_graphql(query, {"owner": owner, "repo": repo}, pat)
+        categories = result["data"]["repository"]["discussionCategories"]["nodes"]
+        for cat in categories:
+            if cat["name"].lower() == category_name.lower() or cat["slug"].lower() == category_name.lower():
+                return cat["id"]
+        available = [c["name"] for c in categories]
+        raise ValueError(f"Category '{category_name}' not found. Available: {available}")
+
+    def get_discussion_node_id(
+        self, owner: str, repo: str, number: int, pat: str
+    ) -> str:
+        """Discussion の node ID を取得"""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                discussion(number: $number) {
+                    id
+                }
+            }
+        }
+        """
+        result = self.execute_graphql(
+            query, {"owner": owner, "repo": repo, "number": number}, pat
+        )
+        discussion = result["data"]["repository"]["discussion"]
+        if not discussion:
+            raise ValueError(f"Discussion #{number} not found")
+        return discussion["id"]
+
+    def execute_list_discussions(
+        self, owner: str, repo: str, pat: str
+    ) -> dict:
+        """Discussion 一覧を取得"""
+        query = """
+        query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) {
+                discussions(first: 30, orderBy: {field: CREATED_AT, direction: DESC}) {
+                    nodes {
+                        number
+                        title
+                        author { login }
+                        createdAt
+                        category { name }
+                        comments { totalCount }
+                    }
+                }
+            }
+        }
+        """
+        result = self.execute_graphql(query, {"owner": owner, "repo": repo}, pat)
+        discussions = result["data"]["repository"]["discussions"]["nodes"]
+
+        # Format output similar to gh issue list
+        lines = []
+        for d in discussions:
+            author = d["author"]["login"] if d["author"] else "ghost"
+            comments = d["comments"]["totalCount"]
+            category = d["category"]["name"] if d["category"] else ""
+            lines.append(f"#{d['number']}\t{d['title']}\t{author}\t{category}\t{comments} comments")
+
+        return {"exit_code": 0, "stdout": "\n".join(lines), "stderr": ""}
+
+    def execute_view_discussion(
+        self, owner: str, repo: str, number: int, pat: str
+    ) -> dict:
+        """Discussion 詳細を取得"""
+        query = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+                discussion(number: $number) {
+                    number
+                    title
+                    body
+                    author { login }
+                    createdAt
+                    category { name }
+                    url
+                    comments(first: 50) {
+                        nodes {
+                            id
+                            author { login }
+                            body
+                            createdAt
+                        }
+                    }
+                }
+            }
+        }
+        """
+        result = self.execute_graphql(
+            query, {"owner": owner, "repo": repo, "number": number}, pat
+        )
+        d = result["data"]["repository"]["discussion"]
+        if not d:
+            raise ValueError(f"Discussion #{number} not found")
+
+        author = d["author"]["login"] if d["author"] else "ghost"
+        lines = [
+            f"title:\t{d['title']}",
+            f"number:\t{d['number']}",
+            f"author:\t{author}",
+            f"category:\t{d['category']['name'] if d['category'] else ''}",
+            f"url:\t{d['url']}",
+            f"created:\t{d['createdAt']}",
+            "",
+            "--- BODY ---",
+            d["body"] or "(empty)",
+            "",
+            "--- COMMENTS ---",
+        ]
+        for c in d["comments"]["nodes"]:
+            c_author = c["author"]["login"] if c["author"] else "ghost"
+            lines.append(f"\n[{c['id']}] {c_author} at {c['createdAt']}:")
+            lines.append(c["body"])
+
+        return {"exit_code": 0, "stdout": "\n".join(lines), "stderr": ""}
+
+    def execute_create_discussion(
+        self, owner: str, repo: str, title: str, body: str, category: str, pat: str
+    ) -> dict:
+        """Discussion を作成"""
+        repo_id = self.get_repository_id(owner, repo, pat)
+        category_id = self.get_discussion_category_id(owner, repo, category, pat)
+
+        mutation = """
+        mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
+            createDiscussion(input: {repositoryId: $repositoryId, categoryId: $categoryId, title: $title, body: $body}) {
+                discussion {
+                    number
+                    url
+                }
+            }
+        }
+        """
+        variables = {
+            "repositoryId": repo_id,
+            "categoryId": category_id,
+            "title": title,
+            "body": body,
+        }
+        result = self.execute_graphql(mutation, variables, pat)
+        d = result["data"]["createDiscussion"]["discussion"]
+
+        return {
+            "exit_code": 0,
+            "stdout": d["url"],
+            "stderr": f"Created discussion #{d['number']}"
+        }
+
+    def execute_update_discussion(
+        self, owner: str, repo: str, number: int, title: str | None, body: str | None, pat: str
+    ) -> dict:
+        """Discussion を更新"""
+        discussion_id = self.get_discussion_node_id(owner, repo, number, pat)
+
+        mutation = """
+        mutation($discussionId: ID!, $title: String, $body: String) {
+            updateDiscussion(input: {discussionId: $discussionId, title: $title, body: $body}) {
+                discussion {
+                    number
+                    url
+                }
+            }
+        }
+        """
+        variables = {
+            "discussionId": discussion_id,
+            "title": title,
+            "body": body,
+        }
+        result = self.execute_graphql(mutation, variables, pat)
+        d = result["data"]["updateDiscussion"]["discussion"]
+
+        return {
+            "exit_code": 0,
+            "stdout": d["url"],
+            "stderr": f"Updated discussion #{d['number']}"
+        }
+
+    def execute_add_discussion_comment(
+        self, owner: str, repo: str, number: int, body: str, reply_to: str | None, pat: str
+    ) -> dict:
+        """Discussion にコメントを追加"""
+        discussion_id = self.get_discussion_node_id(owner, repo, number, pat)
+
+        mutation = """
+        mutation($discussionId: ID!, $body: String!, $replyToId: ID) {
+            addDiscussionComment(input: {discussionId: $discussionId, body: $body, replyToId: $replyToId}) {
+                comment {
+                    id
+                    url
+                }
+            }
+        }
+        """
+        variables = {
+            "discussionId": discussion_id,
+            "body": body,
+            "replyToId": reply_to,
+        }
+        result = self.execute_graphql(mutation, variables, pat)
+        c = result["data"]["addDiscussionComment"]["comment"]
+
+        return {
+            "exit_code": 0,
+            "stdout": c["url"],
+            "stderr": f"Added comment {c['id']}"
+        }
+
+    def execute_update_discussion_comment(
+        self, comment_id: str, body: str, pat: str
+    ) -> dict:
+        """Discussion コメントを更新"""
+        mutation = """
+        mutation($commentId: ID!, $body: String!) {
+            updateDiscussionComment(input: {commentId: $commentId, body: $body}) {
+                comment {
+                    id
+                    url
+                }
+            }
+        }
+        """
+        variables = {
+            "commentId": comment_id,
+            "body": body,
+        }
+        result = self.execute_graphql(mutation, variables, pat)
+        c = result["data"]["updateDiscussionComment"]["comment"]
+
+        return {
+            "exit_code": 0,
+            "stdout": c["url"],
+            "stderr": f"Updated comment {c['id']}"
         }
 
     def do_GET(self):
