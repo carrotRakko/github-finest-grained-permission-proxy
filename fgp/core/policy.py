@@ -212,9 +212,16 @@ DISCUSSION_LAYER1_ACTIONS = [
     "discussions:get",
     "discussions:create",
     "discussions:update",
+    "discussions:close",
+    "discussions:reopen",
+    "discussions:delete",
     "discussions:comment_list",
     "discussions:comment_add",
     "discussions:comment_edit",
+    "discussions:comment_delete",
+    "discussions:answer",
+    "discussions:unanswer",
+    "discussions:poll_vote",
 ]
 
 # For backward compatibility

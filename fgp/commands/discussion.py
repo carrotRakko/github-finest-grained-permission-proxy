@@ -13,9 +13,16 @@ ACTIONS = [
     "discussions:get",
     "discussions:create",
     "discussions:update",
+    "discussions:close",
+    "discussions:reopen",
+    "discussions:delete",
     "discussions:comment_list",
     "discussions:comment_add",
     "discussions:comment_edit",
+    "discussions:comment_delete",
+    "discussions:answer",
+    "discussions:unanswer",
+    "discussions:poll_vote",
 ]
 
 # CLI command -> action mapping
@@ -24,13 +31,13 @@ CLI_ACTIONS = {
     "view": "discussions:get",
     "create": "discussions:create",
     "edit": "discussions:update",
+    "close": "discussions:close",
+    "reopen": "discussions:reopen",
+    "delete": "discussions:delete",
     "comment": None,  # Determined by subcommand
-}
-
-# Comment subcommand -> action mapping
-COMMENT_CLI_ACTIONS = {
-    "add": "discussions:comment_add",
-    "edit": "discussions:comment_edit",
+    "answer": "discussions:answer",
+    "unanswer": "discussions:unanswer",
+    "poll": None,  # Determined by subcommand
 }
 
 
@@ -43,12 +50,23 @@ def get_action(subcmd: str | None, args: list[str]) -> tuple[str | None, str | N
     if subcmd == "comment":
         if not args:
             return None, None
+        # "comment delete <id>" -> comment_delete
         # "comment edit <id>" -> comment_edit
         # "comment <number>" -> comment_add (add comment to discussion)
-        if args[0] == "edit":
+        if args[0] == "delete":
+            return "discussions:comment_delete", None
+        elif args[0] == "edit":
             return "discussions:comment_edit", None
         else:
             return "discussions:comment_add", None
+
+    # Handle poll subcommand
+    if subcmd == "poll":
+        if not args:
+            return None, None
+        if args[0] == "vote":
+            return "discussions:poll_vote", None
+        return None, None
 
     action = CLI_ACTIONS.get(subcmd)
     return (action, None) if action else (None, None)
@@ -82,8 +100,41 @@ def execute(args: list[str], owner: str, repo: str, pat: str) -> dict:
         title, body = _parse_edit_args(rest[1:])
         return _update_discussion(owner, repo, number, title, body, pat)
 
+    elif subcmd == "close":
+        if not rest:
+            raise ValueError("discussion number required")
+        number = int(rest[0])
+        return _close_discussion(owner, repo, number, pat)
+
+    elif subcmd == "reopen":
+        if not rest:
+            raise ValueError("discussion number required")
+        number = int(rest[0])
+        return _reopen_discussion(owner, repo, number, pat)
+
+    elif subcmd == "delete":
+        if not rest:
+            raise ValueError("discussion number required")
+        number = int(rest[0])
+        return _delete_discussion(owner, repo, number, pat)
+
     elif subcmd == "comment":
         return _handle_comment(rest, owner, repo, pat)
+
+    elif subcmd == "answer":
+        if not rest:
+            raise ValueError("comment_id required")
+        comment_id = rest[0]
+        return _mark_answer(comment_id, pat)
+
+    elif subcmd == "unanswer":
+        if not rest:
+            raise ValueError("comment_id required")
+        comment_id = rest[0]
+        return _unmark_answer(comment_id, pat)
+
+    elif subcmd == "poll":
+        return _handle_poll(rest, pat)
 
     else:
         raise ValueError(f"Unknown discussion subcommand: {subcmd}")
@@ -144,9 +195,16 @@ def _parse_edit_args(args: list[str]) -> tuple[str | None, str | None]:
 
 
 def _handle_comment(args: list[str], owner: str, repo: str, pat: str) -> dict:
-    """Handle comment subcommand (add or edit)."""
+    """Handle comment subcommand (add, edit, or delete)."""
     if not args:
-        raise ValueError("discussion number or 'edit' required")
+        raise ValueError("discussion number or 'edit'/'delete' required")
+
+    # Check if it's "comment delete <comment_id>"
+    if args[0] == "delete":
+        if len(args) < 2:
+            raise ValueError("comment_id required")
+        comment_id = args[1]
+        return _delete_comment(comment_id, pat)
 
     # Check if it's "comment edit <comment_id>"
     if args[0] == "edit":
@@ -155,11 +213,11 @@ def _handle_comment(args: list[str], owner: str, repo: str, pat: str) -> dict:
         comment_id = args[1]
         body = _parse_comment_body(args[2:])
         return _update_comment(comment_id, body, pat)
-    else:
-        # Add comment: comment <number> --body "..."
-        number = int(args[0])
-        body, reply_to = _parse_add_comment_args(args[1:])
-        return _add_comment(owner, repo, number, body, reply_to, pat)
+
+    # Add comment: comment <number> --body "..."
+    number = int(args[0])
+    body, reply_to = _parse_add_comment_args(args[1:])
+    return _add_comment(owner, repo, number, body, reply_to, pat)
 
 
 def _parse_comment_body(args: list[str]) -> str:
@@ -449,4 +507,180 @@ def _update_comment(comment_id: str, body: str, pat: str) -> dict:
         "exit_code": 0,
         "stdout": c["url"],
         "stderr": f"Updated comment {c['id']}"
+    }
+
+
+def _close_discussion(owner: str, repo: str, number: int, pat: str) -> dict:
+    """Close a discussion."""
+    discussion_id = _get_discussion_node_id(owner, repo, number, pat)
+
+    mutation = """
+    mutation($discussionId: ID!) {
+        closeDiscussion(input: {discussionId: $discussionId}) {
+            discussion {
+                number
+                url
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"discussionId": discussion_id}, pat)
+    d = result["data"]["closeDiscussion"]["discussion"]
+
+    return {
+        "exit_code": 0,
+        "stdout": d["url"],
+        "stderr": f"Closed discussion #{d['number']}"
+    }
+
+
+def _reopen_discussion(owner: str, repo: str, number: int, pat: str) -> dict:
+    """Reopen a discussion."""
+    discussion_id = _get_discussion_node_id(owner, repo, number, pat)
+
+    mutation = """
+    mutation($discussionId: ID!) {
+        reopenDiscussion(input: {discussionId: $discussionId}) {
+            discussion {
+                number
+                url
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"discussionId": discussion_id}, pat)
+    d = result["data"]["reopenDiscussion"]["discussion"]
+
+    return {
+        "exit_code": 0,
+        "stdout": d["url"],
+        "stderr": f"Reopened discussion #{d['number']}"
+    }
+
+
+def _delete_discussion(owner: str, repo: str, number: int, pat: str) -> dict:
+    """Delete a discussion."""
+    discussion_id = _get_discussion_node_id(owner, repo, number, pat)
+
+    mutation = """
+    mutation($discussionId: ID!) {
+        deleteDiscussion(input: {id: $discussionId}) {
+            discussion {
+                number
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"discussionId": discussion_id}, pat)
+    d = result["data"]["deleteDiscussion"]["discussion"]
+
+    return {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": f"Deleted discussion #{d['number']}"
+    }
+
+
+def _delete_comment(comment_id: str, pat: str) -> dict:
+    """Delete a discussion comment."""
+    mutation = """
+    mutation($commentId: ID!) {
+        deleteDiscussionComment(input: {id: $commentId}) {
+            comment {
+                id
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"commentId": comment_id}, pat)
+    c = result["data"]["deleteDiscussionComment"]["comment"]
+
+    return {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": f"Deleted comment {c['id']}"
+    }
+
+
+def _mark_answer(comment_id: str, pat: str) -> dict:
+    """Mark a comment as the answer."""
+    mutation = """
+    mutation($commentId: ID!) {
+        markDiscussionCommentAsAnswer(input: {id: $commentId}) {
+            discussion {
+                number
+                url
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"commentId": comment_id}, pat)
+    d = result["data"]["markDiscussionCommentAsAnswer"]["discussion"]
+
+    return {
+        "exit_code": 0,
+        "stdout": d["url"],
+        "stderr": f"Marked as answer in discussion #{d['number']}"
+    }
+
+
+def _unmark_answer(comment_id: str, pat: str) -> dict:
+    """Unmark a comment as the answer."""
+    mutation = """
+    mutation($commentId: ID!) {
+        unmarkDiscussionCommentAsAnswer(input: {id: $commentId}) {
+            discussion {
+                number
+                url
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"commentId": comment_id}, pat)
+    d = result["data"]["unmarkDiscussionCommentAsAnswer"]["discussion"]
+
+    return {
+        "exit_code": 0,
+        "stdout": d["url"],
+        "stderr": f"Unmarked answer in discussion #{d['number']}"
+    }
+
+
+def _handle_poll(args: list[str], pat: str) -> dict:
+    """Handle poll subcommand."""
+    if not args:
+        raise ValueError("poll subcommand required (vote)")
+
+    subcmd = args[0]
+    rest = args[1:]
+
+    if subcmd == "vote":
+        if not rest:
+            raise ValueError("option_id required")
+        option_id = rest[0]
+        return _poll_vote(option_id, pat)
+    else:
+        raise ValueError(f"Unknown poll subcommand: {subcmd}")
+
+
+def _poll_vote(option_id: str, pat: str) -> dict:
+    """Vote on a discussion poll."""
+    mutation = """
+    mutation($optionId: ID!) {
+        addDiscussionPollVote(input: {pollOptionId: $optionId}) {
+            pollOption {
+                id
+                option
+                totalVoteCount
+            }
+        }
+    }
+    """
+    result = execute_graphql(mutation, {"optionId": option_id}, pat)
+    opt = result["data"]["addDiscussionPollVote"]["pollOption"]
+
+    return {
+        "exit_code": 0,
+        "stdout": f"Voted for: {opt['option']} (total: {opt['totalVoteCount']})",
+        "stderr": ""
     }
