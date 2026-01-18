@@ -255,7 +255,7 @@ ACTION_CATEGORIES = {
     "issues": ["issues:read", "issues:write"],
     "pr": ["pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review"] + PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
-    "discussions": ["discussions:write"],
+    "discussions": ["discussions:read", "discussions:write"],
     "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
 }
 
