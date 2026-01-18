@@ -10,6 +10,8 @@ import re
 import sys
 from pathlib import Path
 
+import json5
+
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "github-proxy" / "config.json"
 DEFAULT_PORT = 8766
 
@@ -469,9 +471,9 @@ EOF""", file=sys.stderr)
 
     try:
         with open(config_path) as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
+            config = json5.load(f)
+    except ValueError as e:
+        print(f"Error: Invalid JSON5 in config file: {e}", file=sys.stderr)
         sys.exit(1)
 
     if "classic_pat" not in config:
