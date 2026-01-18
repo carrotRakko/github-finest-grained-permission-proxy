@@ -123,6 +123,14 @@ handle_auth() {
         return 0
     fi
 
+    # Check for --help anywhere in args
+    for arg in "$@"; do
+        if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+            show_auth_help
+            return 0
+        fi
+    done
+
     if [[ "$action" != "status" ]]; then
         echo "Unknown command: $action" >&2
         echo "Run 'fgh auth --help' for usage." >&2
@@ -222,12 +230,19 @@ USAGE
   fgh discussion <command> [flags]
 
 COMMANDS
-  list:           List discussions in a repository
-  view:           View a discussion
-  create:         Create a new discussion
-  edit:           Edit a discussion
-  comment:        Add a comment to a discussion
-  comment edit:   Edit a discussion comment (by ID)
+  list:             List discussions in a repository
+  view:             View a discussion
+  create:           Create a new discussion
+  edit:             Edit a discussion
+  close:            Close a discussion
+  reopen:           Reopen a discussion
+  delete:           Delete a discussion
+  comment:          Add a comment to a discussion
+  comment edit:     Edit a discussion comment (by ID)
+  comment delete:   Delete a discussion comment (by ID)
+  answer:           Mark a comment as the answer (Q&A only)
+  unanswer:         Unmark a comment as the answer (Q&A only)
+  poll vote:        Vote on a discussion poll (Polls only)
 
 FLAGS
   -R, --repo <owner/repo>   Specify repository (default: from git remote)
@@ -241,8 +256,15 @@ EXAMPLES
   fgh discussion view 123
   fgh discussion create --title "Feature request" --body "..." --category "Ideas"
   fgh discussion edit 123 --body "Updated body"
+  fgh discussion close 123
+  fgh discussion reopen 123
+  fgh discussion delete 123
   fgh discussion comment 123 --body "My comment"
   fgh discussion comment edit DC_xxx --body "Updated comment"
+  fgh discussion comment delete DC_xxx
+  fgh discussion answer DC_xxx
+  fgh discussion unanswer DC_xxx
+  fgh discussion poll vote PO_xxx
 EOF
 }
 
@@ -253,6 +275,14 @@ handle_discussion() {
         show_discussion_help
         return 0
     fi
+
+    # Check for --help anywhere in args
+    for arg in "$@"; do
+        if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+            show_discussion_help
+            return 0
+        fi
+    done
 
     shift
 
@@ -323,11 +353,19 @@ EOF
 handle_sub_issue() {
     local action="$1"
 
-    # 引数なしならヘルプ表示
-    if [[ -z "$action" ]]; then
+    # 引数なしまたは --help ならヘルプ表示
+    if [[ -z "$action" || "$action" == "--help" || "$action" == "-h" ]]; then
         show_sub_issue_help
         return 0
     fi
+
+    # Check for --help anywhere in args
+    for arg in "$@"; do
+        if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+            show_sub_issue_help
+            return 0
+        fi
+    done
 
     shift
 
@@ -423,22 +461,30 @@ handle_sub_issue() {
     esac
 }
 
+# メインヘルプ表示
+show_main_help() {
+    cat <<'EOF'
+fgh - finest-grained gh
+
+USAGE
+  fgh <command> [args...]
+
+COMMANDS
+  auth        Manage authentication state
+  discussion  Work with discussions (custom implementation)
+  issue       Work with issues (via gh)
+  pr          Work with pull requests (via gh)
+  sub-issue   Work with sub-issues (custom implementation)
+
+Run 'fgh <command> --help' for more information on a command.
+All commands are forwarded to fgp proxy for permission checking.
+EOF
+}
+
 # メイン
 main() {
-    if [[ $# -eq 0 ]]; then
-        echo "fgh - finest-grained gh"
-        echo ""
-        echo "Usage: fgh <command> [args...]"
-        echo ""
-        echo "Commands:"
-        echo "  auth        Manage authentication state"
-        echo "  discussion  Work with discussions"
-        echo "  issue       Work with issues"
-        echo "  pr          Work with pull requests"
-        echo "  sub-issue   Work with sub-issues"
-        echo "  api         Make API requests"
-        echo ""
-        echo "All commands are forwarded to fgp proxy."
+    if [[ $# -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
+        show_main_help
         return 0
     fi
 
@@ -463,6 +509,22 @@ main() {
         shift
         handle_sub_issue "$@"
         return
+    fi
+
+    # issue/pr の引数なし or --help は gh に直接流す
+    if [[ "$subcommand" == "issue" || "$subcommand" == "pr" ]]; then
+        local second_arg="$2"
+        if [[ -z "$second_arg" || "$second_arg" == "--help" || "$second_arg" == "-h" ]]; then
+            gh "$subcommand" --help
+            return
+        fi
+        # Check for --help anywhere in args
+        for arg in "$@"; do
+            if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+                gh "$subcommand" --help
+                return
+            fi
+        done
     fi
 
     # owner/repo を取得
