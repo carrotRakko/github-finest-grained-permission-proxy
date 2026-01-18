@@ -7,19 +7,30 @@ gh CLI doesn't have `gh discussion` command, so this is a custom implementation.
 
 from ..core.graphql import execute_graphql, get_repository_id
 
-# Actions this module provides
+# Actions this module provides (Layer 1 only)
 ACTIONS = [
-    "discussions:read",
-    "discussions:write",
+    "discussions:list",
+    "discussions:get",
+    "discussions:create",
+    "discussions:update",
+    "discussions:comment_list",
+    "discussions:comment_add",
+    "discussions:comment_edit",
 ]
 
 # CLI command -> action mapping
 CLI_ACTIONS = {
-    "list": "discussions:read",
-    "view": "discussions:read",
-    "create": "discussions:write",
-    "edit": "discussions:write",
-    "comment": "discussions:write",
+    "list": "discussions:list",
+    "view": "discussions:get",
+    "create": "discussions:create",
+    "edit": "discussions:update",
+    "comment": None,  # Determined by subcommand
+}
+
+# Comment subcommand -> action mapping
+COMMENT_CLI_ACTIONS = {
+    "add": "discussions:comment_add",
+    "edit": "discussions:comment_edit",
 }
 
 
@@ -27,6 +38,17 @@ def get_action(subcmd: str | None, args: list[str]) -> tuple[str | None, str | N
     """Get action for discussion subcommand."""
     if subcmd is None:
         return None, None
+
+    # Handle comment subcommand specially
+    if subcmd == "comment":
+        if not args:
+            return None, None
+        # "comment edit <id>" -> comment_edit
+        # "comment <number>" -> comment_add (add comment to discussion)
+        if args[0] == "edit":
+            return "discussions:comment_edit", None
+        else:
+            return "discussions:comment_add", None
 
     action = CLI_ACTIONS.get(subcmd)
     return (action, None) if action else (None, None)
