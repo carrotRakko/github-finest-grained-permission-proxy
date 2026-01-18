@@ -121,7 +121,7 @@ GIT_ENDPOINT_ACTIONS = [
 ]
 
 GRAPHQL_MUTATION_ACTIONS = {
-    "addDiscussionComment": "discussions:write",
+    "addDiscussionComment": "discussions:comment_add",
 }
 
 # =============================================================================
@@ -206,6 +206,17 @@ def get_all_actions() -> list[str]:
     ]
     return base_actions + PR_LAYER1_ACTIONS + _COMMAND_ACTIONS
 
+# Discussion Layer 1 actions
+DISCUSSION_LAYER1_ACTIONS = [
+    "discussions:list",
+    "discussions:get",
+    "discussions:create",
+    "discussions:update",
+    "discussions:comment_list",
+    "discussions:comment_add",
+    "discussions:comment_edit",
+]
+
 # For backward compatibility
 ALL_ACTIONS = [
     "metadata:read",
@@ -214,10 +225,9 @@ ALL_ACTIONS = [
     "code:read", "code:write",
     "issues:read", "issues:write",
     "git:read", "git:write",
-    "discussions:read", "discussions:write",
     "subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize",
     "pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review",
-] + PR_LAYER1_ACTIONS
+] + PR_LAYER1_ACTIONS + DISCUSSION_LAYER1_ACTIONS
 
 ACTION_CATEGORIES = {
     "metadata": ["metadata:read"],
@@ -227,7 +237,7 @@ ACTION_CATEGORIES = {
     "issues": ["issues:read", "issues:write"],
     "pr": ["pr:read", "pr:create", "pr:write", "pr:merge", "pr:comment", "pr:review"] + PR_LAYER1_ACTIONS,
     "git": ["git:read", "git:write"],
-    "discussions": ["discussions:read", "discussions:write"],
+    "discussions": DISCUSSION_LAYER1_ACTIONS,
     "subissues": ["subissues:list", "subissues:parent", "subissues:add", "subissues:remove", "subissues:reprioritize"],
 }
 
