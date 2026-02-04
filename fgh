@@ -30,6 +30,15 @@ get_repo_from_git() {
     fi
 }
 
+# API endpoint から owner/repo を取得
+# 例: repos/owner/repo/issues -> owner/repo
+get_repo_from_api_endpoint() {
+    local endpoint="$1"
+    if [[ "$endpoint" =~ ^/?repos/([^/]+)/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+}
+
 # -R/--repo オプションから owner/repo を取得
 get_repo_from_args() {
     local args=("$@")
@@ -573,6 +582,15 @@ main() {
     repo=$(get_repo_from_args "$@")
     if [[ -z "$repo" ]]; then
         repo=$(get_repo_from_git)
+    fi
+
+    # api コマンドの場合は endpoint から repo を抽出
+    if [[ -z "$repo" && "$subcommand" == "api" ]]; then
+        # 第2引数が endpoint
+        local endpoint="$2"
+        if [[ -n "$endpoint" ]]; then
+            repo=$(get_repo_from_api_endpoint "$endpoint")
+        fi
     fi
 
     if [[ -z "$repo" ]]; then
