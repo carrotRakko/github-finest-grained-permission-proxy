@@ -1,0 +1,13 @@
+{
+  // PATs are evaluated top-to-bottom, first match wins
+  "pats": [
+    // Fine-grained PAT for your org
+    { "token": "github_pat_YOUR_ORG_PAT", "repos": ["your-org/*"] },
+
+    // Fine-grained PAT for your personal repos
+    { "token": "github_pat_YOUR_PERSONAL_PAT", "repos": ["your-username/*"] },
+
+    // Classic PAT as fallback (for collaborator repos, external orgs, etc.)
+    { "token": "ghp_YOUR_CLASSIC_PAT", "repos": ["*"] }
+  ]
+}
