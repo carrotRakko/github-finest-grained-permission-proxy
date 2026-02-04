@@ -582,8 +582,15 @@ main() {
 
     # api コマンドの場合は endpoint から repo を抽出（優先）
     if [[ "$subcommand" == "api" ]]; then
-        # 第2引数が endpoint
         local endpoint="$2"
+
+        # graphql は禁止
+        if [[ "$endpoint" == "graphql" ]]; then
+            echo "Error: GraphQL API is not supported. Use high-level commands (issue, pr, discussion, sub-issue) instead." >&2
+            return 1
+        fi
+
+        # endpoint から repo を抽出
         if [[ -n "$endpoint" ]]; then
             repo=$(get_repo_from_api_endpoint "$endpoint")
         fi
