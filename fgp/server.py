@@ -8,11 +8,17 @@ from pathlib import Path
 
 from .core.policy import (
     load_config,
-    ACTION_CATEGORIES,
     DEFAULT_CONFIG_PATH,
     DEFAULT_PORT,
 )
 from .handler import GitHubProxyHandler
+
+
+def mask_token(token: str) -> str:
+    """Mask token for display."""
+    if len(token) > 12:
+        return f"{token[:4]}...{token[-4:]}"
+    return "****"
 
 
 def main():
@@ -35,16 +41,22 @@ def main():
     print(f"GitHub Proxy listening on http://0.0.0.0:{args.port}")
     print(f"Config: {args.config}")
 
-    print(f"\nSupported actions:")
-    for category, actions in ACTION_CATEGORIES.items():
-        print(f"  {category}: {', '.join(a.split(':')[1] for a in actions)}")
-
-    print(f"\nPolicy rules: {len(config['rules'])}")
-    for i, rule in enumerate(config["rules"]):
-        effect = rule["effect"].upper()
-        actions = ", ".join(rule["actions"])
-        repos = ", ".join(rule["repos"])
-        print(f"  [{i}] {effect}: {actions} on {repos}")
+    # Display PAT configuration
+    if "pats" in config:
+        print(f"\nPATs configured: {len(config['pats'])}")
+        for i, pat_entry in enumerate(config["pats"]):
+            masked = mask_token(pat_entry["token"])
+            repos = ", ".join(pat_entry["repos"])
+            print(f"  [{i}] {masked} -> {repos}")
+    else:
+        # Legacy format
+        print(f"\nClassic PAT: {mask_token(config['classic_pat'])}")
+        if config.get("fine_grained_pats"):
+            print(f"Fine-grained PATs: {len(config['fine_grained_pats'])}")
+            for i, fg_pat in enumerate(config["fine_grained_pats"]):
+                masked = mask_token(fg_pat["pat"])
+                repos = ", ".join(fg_pat["repos"])
+                print(f"  [{i}] {masked} -> {repos}")
 
     print("\nPress Ctrl+C to stop")
 

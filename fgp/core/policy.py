@@ -448,12 +448,37 @@ def match_git_endpoint(method: str, path: str, query: str) -> tuple[str | None, 
 # =============================================================================
 
 def select_pat(repo: str, config: dict) -> str:
-    """Select appropriate PAT for repository."""
+    """
+    Select appropriate PAT for repository.
+
+    New format (pats array):
+    {
+      "pats": [
+        { "token": "github_pat_xxx", "repos": ["owner/*"] },
+        { "token": "ghp_yyy", "repos": ["*"] }
+      ]
+    }
+
+    Legacy format (classic_pat + fine_grained_pats):
+    {
+      "classic_pat": "ghp_xxx",
+      "fine_grained_pats": [...]
+    }
+    """
+    # New format: pats array
+    if "pats" in config:
+        for pat_entry in config["pats"]:
+            for repo_pattern in pat_entry.get("repos", []):
+                if expand_repo_pattern(repo_pattern, repo):
+                    return pat_entry["token"]
+        return None  # No matching PAT
+
+    # Legacy format: fine_grained_pats + classic_pat fallback
     for fg_pat in config.get("fine_grained_pats", []):
         for repo_pattern in fg_pat.get("repos", []):
             if expand_repo_pattern(repo_pattern, repo):
                 return fg_pat["pat"]
-    return config["classic_pat"]
+    return config.get("classic_pat")
 
 
 # =============================================================================
@@ -468,13 +493,10 @@ def load_config(config_path: Path) -> dict:
         print(f"  mkdir -p {config_path.parent}", file=sys.stderr)
         print(f"  cat > {config_path} << 'EOF'", file=sys.stderr)
         print("""{
-  "classic_pat": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "fine_grained_pats": [
-    { "pat": "github_pat_xxx", "repos": ["owner/*"] }
-  ],
-  "rules": [
-    { "effect": "allow", "actions": ["*"], "repos": ["owner/repo"] },
-    { "effect": "deny", "actions": ["pr:merge_*"], "repos": ["*"] }
+  "pats": [
+    { "token": "github_pat_xxx", "repos": ["delight-co/*"] },
+    { "token": "github_pat_yyy", "repos": ["carrotRakko/*"] },
+    { "token": "ghp_zzz", "repos": ["*"] }
   ]
 }
 EOF""", file=sys.stderr)
@@ -493,16 +515,23 @@ EOF""", file=sys.stderr)
         print(f"Error: Invalid JSON5 in config file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # New format: pats array
+    if "pats" in config:
+        if not isinstance(config["pats"], list) or len(config["pats"]) == 0:
+            print("Error: pats must be a non-empty list", file=sys.stderr)
+            sys.exit(1)
+        for i, pat_entry in enumerate(config["pats"]):
+            if "token" not in pat_entry:
+                print(f"Error: pats[{i}] missing 'token'", file=sys.stderr)
+                sys.exit(1)
+            if "repos" not in pat_entry or not isinstance(pat_entry["repos"], list):
+                print(f"Error: pats[{i}] missing or invalid 'repos'", file=sys.stderr)
+                sys.exit(1)
+        return config
+
+    # Legacy format: classic_pat + fine_grained_pats + rules
     if "classic_pat" not in config:
-        print("Error: Missing required field: classic_pat", file=sys.stderr)
-        sys.exit(1)
-
-    if "rules" not in config:
-        print("Error: Missing required field: rules", file=sys.stderr)
-        sys.exit(1)
-
-    if not isinstance(config["rules"], list) or len(config["rules"]) == 0:
-        print("Error: rules must be a non-empty list", file=sys.stderr)
+        print("Error: Missing required field: classic_pat (or use new 'pats' format)", file=sys.stderr)
         sys.exit(1)
 
     if "fine_grained_pats" in config:
@@ -519,18 +548,23 @@ EOF""", file=sys.stderr)
     else:
         config["fine_grained_pats"] = []
 
-    for i, rule in enumerate(config["rules"]):
-        if "effect" not in rule:
-            print(f"Error: Rule {i} missing 'effect'", file=sys.stderr)
+    # rules is optional in legacy format (for backward compatibility during transition)
+    if "rules" in config:
+        if not isinstance(config["rules"], list):
+            print("Error: rules must be a list", file=sys.stderr)
             sys.exit(1)
-        if rule["effect"] not in ["allow", "deny"]:
-            print(f"Error: Rule {i} effect must be 'allow' or 'deny'", file=sys.stderr)
-            sys.exit(1)
-        if "actions" not in rule or not isinstance(rule["actions"], list):
-            print(f"Error: Rule {i} missing or invalid 'actions'", file=sys.stderr)
-            sys.exit(1)
-        if "repos" not in rule or not isinstance(rule["repos"], list):
-            print(f"Error: Rule {i} missing or invalid 'repos'", file=sys.stderr)
-            sys.exit(1)
+        for i, rule in enumerate(config["rules"]):
+            if "effect" not in rule:
+                print(f"Error: Rule {i} missing 'effect'", file=sys.stderr)
+                sys.exit(1)
+            if rule["effect"] not in ["allow", "deny"]:
+                print(f"Error: Rule {i} effect must be 'allow' or 'deny'", file=sys.stderr)
+                sys.exit(1)
+            if "actions" not in rule or not isinstance(rule["actions"], list):
+                print(f"Error: Rule {i} missing or invalid 'actions'", file=sys.stderr)
+                sys.exit(1)
+            if "repos" not in rule or not isinstance(rule["repos"], list):
+                print(f"Error: Rule {i} missing or invalid 'repos'", file=sys.stderr)
+                sys.exit(1)
 
     return config

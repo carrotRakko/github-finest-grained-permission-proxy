@@ -12,12 +12,10 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 from .core.policy import (
-    evaluate_policy,
     match_git_endpoint,
     select_pat,
-    ACTION_CATEGORIES,
 )
-from .commands import get_cli_action, execute_command, COMMAND_MODULES
+from .commands import execute_command, COMMAND_MODULES
 
 
 class GitHubProxyHandler(BaseHTTPRequestHandler):
@@ -52,21 +50,32 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(405, "Only GET is allowed")
             return
 
-        result = {
-            "classic_pat": self._check_pat_status(
-                self.config["classic_pat"],
-                pat_type="classic"
-            ),
-            "fine_grained_pats": [],
-        }
-
-        for fg_pat in self.config.get("fine_grained_pats", []):
-            status = self._check_pat_status(
-                fg_pat["pat"],
-                pat_type="fine_grained",
-                repos=fg_pat.get("repos", [])
-            )
-            result["fine_grained_pats"].append(status)
+        # New format: pats array
+        if "pats" in self.config:
+            result = {"pats": []}
+            for pat_entry in self.config["pats"]:
+                status = self._check_pat_status(
+                    pat_entry["token"],
+                    pat_type="auto",  # Will detect from token prefix
+                    repos=pat_entry.get("repos", [])
+                )
+                result["pats"].append(status)
+        else:
+            # Legacy format
+            result = {
+                "classic_pat": self._check_pat_status(
+                    self.config["classic_pat"],
+                    pat_type="classic"
+                ),
+                "fine_grained_pats": [],
+            }
+            for fg_pat in self.config.get("fine_grained_pats", []):
+                status = self._check_pat_status(
+                    fg_pat["pat"],
+                    pat_type="fine_grained",
+                    repos=fg_pat.get("repos", [])
+                )
+                result["fine_grained_pats"].append(status)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -170,23 +179,11 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "repo is required")
             return
 
-        # Determine action from command
-        action, error_message = self.cli_args_to_action(args)
-        if action is None:
-            if error_message:
-                self.send_error(403, error_message)
-            else:
-                self.send_error(403, f"Unknown or unsupported command: {args}")
-            return
-
-        # Policy evaluation
-        allowed, reason = evaluate_policy(action, repo, self.config["rules"])
-        if not allowed:
-            self.send_error(403, reason)
-            return
-
-        # Select PAT
+        # Select PAT for this repo
         pat = select_pat(repo, self.config)
+        if not pat:
+            self.send_error(403, f"No PAT configured for repository: {repo}")
+            return
 
         # Execute command
         try:
@@ -235,62 +232,6 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             "stderr": result.stderr
         }
 
-    def cli_args_to_action(self, args: list[str]) -> tuple[str | None, str | None]:
-        """
-        Determine action from CLI args.
-
-        Returns:
-            (action, error_message)
-        """
-        if len(args) < 1:
-            return None, None
-
-        cmd = args[0]
-        subcmd = args[1] if len(args) > 1 else None
-
-        # api command
-        if cmd == "api":
-            if subcmd == "graphql":
-                return None, "GraphQL API is not allowed via proxy. Use high-level commands (issue, pr, sub-issue, discussion) instead."
-            return None, "Direct API calls are not supported yet. Use high-level commands (issue, pr, sub-issue, discussion) instead."
-
-        # Check custom command modules first
-        if cmd in COMMAND_MODULES:
-            return get_cli_action(cmd, subcmd, args)
-
-        if subcmd is None:
-            return None, None
-
-        # issue command
-        if cmd == "issue":
-            if subcmd in ["list", "view"]:
-                return "issues:read", None
-            elif subcmd in ["create", "edit", "close", "reopen", "comment"]:
-                return "issues:write", None
-
-        # pr command
-        if cmd == "pr":
-            if subcmd in ["list", "view", "diff", "checks"]:
-                return "pr:read", None
-            elif subcmd in ["create"]:
-                return "pr:create", None
-            elif subcmd in ["edit", "close", "reopen"]:
-                return "pr:write", None
-            elif subcmd == "merge":
-                if "--squash" in args or "-s" in args:
-                    return "pr:merge_squash", None
-                elif "--rebase" in args or "-r" in args:
-                    return "pr:merge_rebase", None
-                elif "--merge" in args or "-m" in args:
-                    return "pr:merge_commit", None
-                return "pr:merge", None
-            elif subcmd in ["comment"]:
-                return "pr:comment", None
-            elif subcmd in ["review"]:
-                return "pr:review", None
-
-        return None, None
-
     # =========================================================================
     # /git/* endpoint
     # =========================================================================
@@ -301,22 +242,20 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parsed.query
 
-        action, groups = match_git_endpoint(method, path, query)
-        if action is None:
-            self.send_error(403, f"Git endpoint not allowed: {method} {path}")
-            return
+        _, groups = match_git_endpoint(method, path, query)
 
         owner = groups.get("owner")
         repo = groups.get("repo")
         if not owner or not repo:
-            self.send_error(400, "Could not determine repository")
+            self.send_error(400, "Could not determine repository from git path")
             return
 
         full_repo = f"{owner}/{repo}"
 
-        allowed, reason = evaluate_policy(action, full_repo, self.config["rules"])
-        if not allowed:
-            self.send_error(403, reason)
+        # Select PAT for this repo
+        pat = select_pat(full_repo, self.config)
+        if not pat:
+            self.send_error(403, f"No PAT configured for repository: {full_repo}")
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
@@ -324,7 +263,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
         try:
             response_data, response_headers, status_code = self.proxy_git_to_github(
-                method, owner, repo, path, query, body
+                method, owner, repo, path, query, body, pat
             )
             self.send_response(status_code)
             if "Content-Type" in response_headers:
@@ -343,7 +282,7 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def proxy_git_to_github(
-        self, method: str, owner: str, repo: str, path: str, query: str, body: bytes | None
+        self, method: str, owner: str, repo: str, path: str, query: str, body: bytes | None, pat: str
     ) -> tuple[bytes, dict, int]:
         """Proxy git smart HTTP to GitHub."""
         git_path = path.replace(f"/git/{owner}/{repo}.git", f"/{owner}/{repo}.git")
@@ -351,7 +290,6 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         if query:
             url += f"?{query}"
 
-        pat = self.config["classic_pat"]
         credentials = base64.b64encode(f"x-access-token:{pat}".encode()).decode()
 
         headers = {
