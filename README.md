@@ -2,248 +2,153 @@
 
 > **0.x - Unstable API**: This project is in early development. The API may change without notice. Use at your own risk.
 
-GitHub API および git smart HTTP protocol への権限制限付きプロキシ。
-AI エージェントに Classic PAT の一部権限だけを公開する。
+A proxy that isolates GitHub PATs from AI agents running in containers.
 
-**略称**: `fgp-proxy`
+**Abbreviation**: `fgp`
 
-## 背景
+## Background
 
-Fine-grained PAT は他ユーザーのリポジトリ（collaborator として参加しているもの）にはアクセスできない。
-Classic PAT ならアクセスできるが、全リポジトリに Full Access になってしまう。
+When running AI agents (like Claude Code) in containers, storing `GH_TOKEN` as an environment variable is risky - the AI can read it via `printenv` or `/proc/self/environ`.
 
-このプロキシは:
-- Classic PAT をホスト側に置く（AI からは見えない）
-- AWS IAM 式のポリシーで許可/拒否を細かく制御
-- GitHub API と git 操作（clone/fetch/push）の両方をカバー
+This proxy:
+- Keeps PATs on the host side (invisible to AI)
+- Selects the appropriate PAT based on repository
+- Supports multiple PATs (Fine-grained + Classic)
 
-## 仕組み
+## How It Works
 
 ```
-DevContainer (Claude Code)
+Container (fgh CLI)
     ↓ HTTP
-ホスト側プロキシ (このツール)
-    ↓ ポリシー評価 → Classic PAT 付与
+Host-side proxy (fgp)
+    ↓ PAT selection by repo pattern
 GitHub API / github.com (git)
 ```
 
-## セットアップ
+## Setup
 
-### 1. Classic PAT の発行
+### 1. Create PATs
 
-GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+**Fine-grained PAT** (for your repos and orgs):
+- GitHub → Settings → Developer settings → Fine-grained tokens
+- Select repositories you need access to
 
-必要なスコープ:
-- `repo` (Full control of private repositories)
+**Classic PAT** (for collaborator repos, external orgs):
+- GitHub → Settings → Developer settings → Tokens (classic)
+- Required scope: `repo`
 
-### 2. 設定ファイルを作成（ホスト側）
+### 2. Create Config File (Host Side)
 
-```fish
+```bash
 mkdir -p ~/.config/github-proxy
 cat > ~/.config/github-proxy/config.json << 'EOF'
 {
-  "classic_pat": "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "rules": [
-    { "effect": "allow", "actions": ["*"], "repos": ["alice/private-repo"] },
-    { "effect": "allow", "actions": ["metadata:read", "code:*", "git:*"], "repos": ["bob/side-project"] },
-    { "effect": "deny", "actions": ["pulls:merge"], "repos": ["*"] }
+  "pats": [
+    { "token": "github_pat_xxx", "repos": ["your-org/*"] },
+    { "token": "github_pat_yyy", "repos": ["your-username/*"] },
+    { "token": "ghp_zzz", "repos": ["*"] }
   ]
 }
 EOF
 chmod 600 ~/.config/github-proxy/config.json
 ```
 
-## ポリシー評価（AWS IAM 式）
+PATs are evaluated top-to-bottom. First match wins.
 
-評価ロジック:
-1. デフォルト: 暗黙の Deny
-2. 一つでも Deny にマッチ → 即拒否（**Deny always wins**）
-3. 一つでも Allow にマッチ → 許可
-4. 何もマッチしない → 拒否
-
-### ルール形式
-
-```json
-{
-  "effect": "allow" | "deny",
-  "actions": ["action:operation", ...],
-  "repos": ["owner/repo", ...]
-}
-```
-
-### アクション体系（層1/層2）
-
-PR 関連は細かい粒度（層1）と便利セット（層2 Bundle）の両方で設定できる。
-
-**層2 Bundle（便利セット）**:
-
-| Bundle | 説明 |
-|--------|------|
-| `pull-requests:read` | PR 読み取り（公式 Fine-grained PAT 互換） |
-| `pull-requests:write` | PR 読み取り + 書き込み全部（公式 Fine-grained PAT 互換） |
-| `pulls:contribute` | PR 読み取り + 貢献系（作成、コメント、レビュー）、close/delete/merge は含まない |
-
-**層1 Action（細かい粒度）**:
-
-| カテゴリ | アクション例 | 説明 |
-|----------|-------------|------|
-| pr (read) | `pr:list`, `pr:get`, `pr:commits`, `pr:files` | PR 読み取り |
-| pr (write) | `pr:create`, `pr:update`, `pr:comment_create`, `pr:approve` | PR 書き込み |
-| pr (merge) | `pr:merge_commit`, `pr:merge_squash`, `pr:merge_rebase` | PR マージ |
-| pr (admin) | `pr:close`, `pr:reopen`, `pr:comment_delete`, `pr:review_dismiss` | PR 管理 |
-
-詳細は [specs/pr.md](specs/pr.md) を参照。
-
-**その他のアクション**:
-
-| カテゴリ | アクション | 説明 |
-|----------|-----------|------|
-| metadata | `metadata:read` | リポジトリ情報、ブランチ、タグ等 |
-| actions | `actions:read` | GitHub Actions のワークフロー、実行結果 |
-| statuses | `statuses:read` | コミットステータス、チェック結果 |
-| code | `code:read`, `code:write` | ファイル内容、git refs 等 |
-| issues | `issues:read`, `issues:write` | Issue 操作 |
-| git | `git:read`, `git:write` | git clone/fetch/push |
-
-### ワイルドカード
-
-| パターン | 展開 |
-|----------|------|
-| `*` | 全アクション |
-| `issues:*` | `issues:read`, `issues:write` |
-| `pr:*` | 全 PR 層1 action |
-
-### リポジトリパターン
-
-| パターン | マッチ |
-|----------|--------|
-| `owner/repo` | 完全一致（case-insensitive） |
-| `owner/*` | owner の全リポジトリ |
-| `*` | 全リポジトリ |
-
-## 起動（ホスト側で実行）
+### 3. Start the Proxy (Host Side)
 
 ```bash
-cd /path/to/detective-report-agent
-python tools/github-proxy/main.py
+cd /path/to/github-finest-grained-permission-proxy
+uv run python main.py
 ```
 
-デフォルトポート: 8766
+Default port: 8766
 
-起動時にポリシールールが表示される:
+Output:
 ```
 GitHub Proxy listening on http://0.0.0.0:8766
 Config: /Users/you/.config/github-proxy/config.json
 
-Policy rules: 3
-  [0] ALLOW: * on alice/private-repo
-  [1] ALLOW: metadata:read, code:*, git:* on bob/side-project
-  [2] DENY: pulls:merge on *
+PATs configured: 3
+  [0] gith...xxxx -> your-org/*
+  [1] gith...yyyy -> your-username/*
+  [2] ghp_...zzzz -> *
 
-Available actions:
-  metadata: read
-  actions: read
-  statuses: read
-  code: read, write
-  issues: read, write
-  pulls: read, contribute, merge
-  git: read, write
-
-Endpoints: 38 API + 3 git
+Press Ctrl+C to stop
 ```
 
-## 使い方（DevContainer から）
+## Usage (From Container)
 
-### GitHub API
+### fgh CLI
+
+`fgh` is a drop-in replacement for `gh` that routes through fgp.
 
 ```bash
-# リポジトリ情報取得
-curl http://host.docker.internal:8766/repos/alice/private-repo
+# High-level commands (issue, pr, discussion, sub-issue)
+fgh issue list -R owner/repo
+fgh pr view 123 -R owner/repo
+fgh sub-issue list 456 -R owner/repo
+fgh discussion list -R owner/repo
 
-# Issue 一覧
-curl http://host.docker.internal:8766/repos/alice/private-repo/issues
+# REST API (repos/owner/repo/... endpoints)
+fgh api repos/owner/repo
+fgh api repos/owner/repo/issues/123/timeline
 
-# PR 作成
-curl -X POST http://host.docker.internal:8766/repos/alice/private-repo/pulls \
-  -H "Content-Type: application/json" \
-  -d '{"title": "Test PR", "head": "feature-branch", "base": "main"}'
+# Check PAT status
+fgh auth status
 ```
 
-### git 操作（clone/fetch/push）
+### git Operations (clone/fetch/push)
 
 ```bash
-# clone（プロキシ経由）
-git clone http://host.docker.internal:8766/git/alice/private-repo.git
+# Clone via proxy
+git clone http://host.docker.internal:8766/git/owner/repo.git
 
-# 既存リポジトリの remote を変更
-git remote set-url origin http://host.docker.internal:8766/git/alice/private-repo.git
+# Change remote for existing repo
+git remote set-url origin http://host.docker.internal:8766/git/owner/repo.git
 
-# fetch/push は通常通り
+# fetch/push work as usual
 git fetch origin
 git push origin feature-branch
 ```
 
-## 設定例
+## What Works
 
-### 読み取り専用
+| Category | Status |
+|----------|--------|
+| High-level commands (issue, pr) | ✅ All work |
+| REST API (fgh api) | ✅ `repos/owner/repo/...` endpoints |
+| GraphQL | ❌ Blocked |
+| Custom commands (sub-issue, discussion) | ✅ All work |
+| git operations | ✅ clone/fetch/push |
 
-```json
-{
-  "rules": [
-    { "effect": "allow", "actions": ["metadata:read", "code:read", "issues:read", "pull-requests:read"], "repos": ["*"] }
-  ]
-}
+## Repository Pattern
+
+| Pattern | Matches |
+|---------|---------|
+| `owner/repo` | Exact match (case-insensitive) |
+| `owner/*` | All repos of owner |
+| `*` | All repos (fallback) |
+
+## Security
+
+- Config file requires `chmod 600`
+- PATs are invisible to AI (host-side only)
+- Uses HTTP proxy instead of credential helper
+  - credential helper would expose PAT to container
+  - HTTP proxy keeps PAT on host
+- **Local network only**: This proxy has no authentication. Do not expose to the internet.
+
+## Limitations
+
+- **GraphQL not supported**: Use high-level commands (issue, pr, discussion, sub-issue) instead
+- **Git LFS not supported**: Only basic git smart HTTP protocol (clone/fetch/push)
+- **REST API limited to repos/ endpoints**: `/user`, `/orgs/...` etc. won't work (can't determine PAT)
+
+## Installing fgh
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/carrotRakko/github-finest-grained-permission-proxy/main/install.sh | bash
 ```
 
-### AI エージェント向け（PR 貢献は許可、merge/close は禁止）
-
-```json
-{
-  "rules": [
-    { "effect": "allow", "actions": ["pulls:contribute", "code:*", "git:*"], "repos": ["owner/repo"] }
-  ]
-}
-```
-
-`pulls:contribute` は PR 作成・コメント・レビューを許可するが、merge/close/delete は含まない。
-
-### 層1 action で細かく制御
-
-```json
-{
-  "rules": [
-    { "effect": "allow", "actions": ["pull-requests:read", "pr:create", "pr:comment_create"], "repos": ["owner/repo"] },
-    { "effect": "deny", "actions": ["pr:approve", "pr:request_changes"], "repos": ["*"] }
-  ]
-}
-```
-
-PR 作成とコメントは許可、approve/request_changes は禁止。
-
-### リポジトリごとに権限を分ける
-
-```json
-{
-  "rules": [
-    { "effect": "allow", "actions": ["*"], "repos": ["my-org/main-repo"] },
-    { "effect": "allow", "actions": ["metadata:read", "pull-requests:read"], "repos": ["my-org/other-repo"] },
-    { "effect": "deny", "actions": ["pr:merge_commit", "pr:merge_squash", "pr:merge_rebase"], "repos": ["*"] }
-  ]
-}
-```
-
-## セキュリティ
-
-- 設定ファイルは `chmod 600` 必須
-- Classic PAT は AI から見えない（ホスト側のみ）
-- ポリシーにマッチしないリクエストは 403
-- git credential helper 方式ではなく HTTP プロキシ方式を採用
-  - credential helper だと PAT が DevContainer に入ってしまう
-  - HTTP プロキシなら PAT はホスト側に留まる
-- **ローカルネットワーク専用**: このプロキシは認証なしで動作するため、インターネットに公開してはいけない
-
-## 制限事項
-
-- **Git LFS 非対応**: git smart HTTP protocol の基本操作（clone/fetch/push）のみ対応
-- **GitHub API のページネーション**: プロキシはレスポンスをそのまま転送するため、クライアント側で処理が必要
-- **GraphQL (実験的)**: `addDiscussionComment` mutation のみ対応。既知のセキュリティ問題あり（[#2](https://github.com/carrotRakko/github-finest-grained-permission-proxy/issues/2)）。本番環境での使用は非推奨
+Or copy `fgh` to your PATH manually.

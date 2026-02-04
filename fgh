@@ -30,6 +30,15 @@ get_repo_from_git() {
     fi
 }
 
+# API endpoint から owner/repo を取得
+# 例: repos/owner/repo/issues -> owner/repo
+get_repo_from_api_endpoint() {
+    local endpoint="$1"
+    if [[ "$endpoint" =~ ^/?repos/([^/]+)/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+}
+
 # -R/--repo オプションから owner/repo を取得
 get_repo_from_args() {
     local args=("$@")
@@ -154,65 +163,106 @@ handle_auth() {
 
     # Format and display the result
     echo ""
-    echo "Classic PAT:"
-    local classic_valid
-    classic_valid=$(echo "$result" | jq -r '.classic_pat.valid')
-    local classic_masked
-    classic_masked=$(echo "$result" | jq -r '.classic_pat.masked_token')
-    local classic_user
-    classic_user=$(echo "$result" | jq -r '.classic_pat.user // empty')
 
-    if [[ "$classic_valid" == "true" ]]; then
-        echo "  ✓ Valid ($classic_masked)"
-        echo "    User: $classic_user"
-        local scopes
-        scopes=$(echo "$result" | jq -r '.classic_pat.scopes | join(", ")')
-        if [[ -n "$scopes" ]]; then
-            echo "    Scopes: $scopes"
-        fi
-    else
-        local error
-        error=$(echo "$result" | jq -r '.classic_pat.error // "Unknown error"')
-        echo "  ✗ Invalid ($classic_masked)"
-        echo "    Error: $error"
-    fi
+    # Check if new format (pats array) or legacy format
+    local pats_count
+    pats_count=$(echo "$result" | jq '.pats | length // 0')
 
-    # Fine-grained PATs
-    local fg_count
-    fg_count=$(echo "$result" | jq '.fine_grained_pats | length')
-
-    if [[ "$fg_count" -gt 0 ]]; then
+    if [[ "$pats_count" -gt 0 ]]; then
+        # New format: pats array
+        echo "PATs configured: $pats_count"
         echo ""
-        echo "Fine-grained PATs:"
 
-        for ((i=0; i<fg_count; i++)); do
-            local fg_valid
-            fg_valid=$(echo "$result" | jq -r ".fine_grained_pats[$i].valid")
-            local fg_masked
-            fg_masked=$(echo "$result" | jq -r ".fine_grained_pats[$i].masked_token")
-            local fg_repos
-            fg_repos=$(echo "$result" | jq -r ".fine_grained_pats[$i].repos | join(\", \")")
+        for ((i=0; i<pats_count; i++)); do
+            local pat_valid
+            pat_valid=$(echo "$result" | jq -r ".pats[$i].valid")
+            local pat_masked
+            pat_masked=$(echo "$result" | jq -r ".pats[$i].masked_token")
+            local pat_repos
+            pat_repos=$(echo "$result" | jq -r ".pats[$i].repos | join(\", \")")
+            local pat_user
+            pat_user=$(echo "$result" | jq -r ".pats[$i].user // empty")
 
-            if [[ "$fg_valid" == "true" ]]; then
-                local fg_user
-                fg_user=$(echo "$result" | jq -r ".fine_grained_pats[$i].user // empty")
-                echo "  ✓ Valid ($fg_masked)"
-                if [[ -n "$fg_user" ]]; then
-                    echo "    User: $fg_user"
+            if [[ "$pat_valid" == "true" ]]; then
+                echo "  ✓ [$i] $pat_masked"
+                if [[ -n "$pat_user" ]]; then
+                    echo "      User: $pat_user"
                 fi
-                if [[ -n "$fg_repos" ]]; then
-                    echo "    Repos: $fg_repos"
+                if [[ -n "$pat_repos" ]]; then
+                    echo "      Repos: $pat_repos"
                 fi
             else
-                local fg_error
-                fg_error=$(echo "$result" | jq -r ".fine_grained_pats[$i].error // \"Unknown error\"")
-                echo "  ✗ Invalid ($fg_masked)"
-                if [[ -n "$fg_repos" ]]; then
-                    echo "    Repos: $fg_repos"
+                local pat_error
+                pat_error=$(echo "$result" | jq -r ".pats[$i].error // \"Unknown error\"")
+                echo "  ✗ [$i] $pat_masked"
+                if [[ -n "$pat_repos" ]]; then
+                    echo "      Repos: $pat_repos"
                 fi
-                echo "    Error: $fg_error"
+                echo "      Error: $pat_error"
             fi
         done
+    else
+        # Legacy format: classic_pat + fine_grained_pats
+        echo "Classic PAT:"
+        local classic_valid
+        classic_valid=$(echo "$result" | jq -r '.classic_pat.valid')
+        local classic_masked
+        classic_masked=$(echo "$result" | jq -r '.classic_pat.masked_token')
+        local classic_user
+        classic_user=$(echo "$result" | jq -r '.classic_pat.user // empty')
+
+        if [[ "$classic_valid" == "true" ]]; then
+            echo "  ✓ Valid ($classic_masked)"
+            echo "    User: $classic_user"
+            local scopes
+            scopes=$(echo "$result" | jq -r '.classic_pat.scopes | join(", ")')
+            if [[ -n "$scopes" ]]; then
+                echo "    Scopes: $scopes"
+            fi
+        else
+            local error
+            error=$(echo "$result" | jq -r '.classic_pat.error // "Unknown error"')
+            echo "  ✗ Invalid ($classic_masked)"
+            echo "    Error: $error"
+        fi
+
+        # Fine-grained PATs
+        local fg_count
+        fg_count=$(echo "$result" | jq '.fine_grained_pats | length')
+
+        if [[ "$fg_count" -gt 0 ]]; then
+            echo ""
+            echo "Fine-grained PATs:"
+
+            for ((i=0; i<fg_count; i++)); do
+                local fg_valid
+                fg_valid=$(echo "$result" | jq -r ".fine_grained_pats[$i].valid")
+                local fg_masked
+                fg_masked=$(echo "$result" | jq -r ".fine_grained_pats[$i].masked_token")
+                local fg_repos
+                fg_repos=$(echo "$result" | jq -r ".fine_grained_pats[$i].repos | join(\", \")")
+
+                if [[ "$fg_valid" == "true" ]]; then
+                    local fg_user
+                    fg_user=$(echo "$result" | jq -r ".fine_grained_pats[$i].user // empty")
+                    echo "  ✓ Valid ($fg_masked)"
+                    if [[ -n "$fg_user" ]]; then
+                        echo "    User: $fg_user"
+                    fi
+                    if [[ -n "$fg_repos" ]]; then
+                        echo "    Repos: $fg_repos"
+                    fi
+                else
+                    local fg_error
+                    fg_error=$(echo "$result" | jq -r ".fine_grained_pats[$i].error // \"Unknown error\"")
+                    echo "  ✗ Invalid ($fg_masked)"
+                    if [[ -n "$fg_repos" ]]; then
+                        echo "    Repos: $fg_repos"
+                    fi
+                    echo "    Error: $fg_error"
+                fi
+            done
+        fi
     fi
 
     echo ""
@@ -529,7 +579,29 @@ main() {
 
     # owner/repo を取得
     local repo
-    repo=$(get_repo_from_args "$@")
+
+    # api コマンドの場合は endpoint から repo を抽出（優先）
+    if [[ "$subcommand" == "api" ]]; then
+        local endpoint="$2"
+
+        # graphql は禁止
+        if [[ "$endpoint" == "graphql" ]]; then
+            echo "Error: GraphQL API is not supported. Use high-level commands (issue, pr, discussion, sub-issue) instead." >&2
+            return 1
+        fi
+
+        # endpoint から repo を抽出
+        if [[ -n "$endpoint" ]]; then
+            repo=$(get_repo_from_api_endpoint "$endpoint")
+        fi
+    fi
+
+    # -R オプションから取得
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_args "$@")
+    fi
+
+    # git remote から取得
     if [[ -z "$repo" ]]; then
         repo=$(get_repo_from_git)
     fi
