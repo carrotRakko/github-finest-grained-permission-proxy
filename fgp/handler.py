@@ -210,7 +210,11 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
 
     def execute_gh_cli(self, args: list[str], repo: str, pat: str) -> dict:
         """Execute standard gh command via subprocess."""
-        gh_args = ["gh"] + args + ["-R", repo]
+        # Don't add -R for 'api' command (it doesn't support -R flag)
+        if args and args[0] == "api":
+            gh_args = ["gh"] + args
+        else:
+            gh_args = ["gh"] + args + ["-R", repo]
 
         result = subprocess.run(
             gh_args,
