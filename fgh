@@ -579,18 +579,24 @@ main() {
 
     # owner/repo を取得
     local repo
-    repo=$(get_repo_from_args "$@")
-    if [[ -z "$repo" ]]; then
-        repo=$(get_repo_from_git)
-    fi
 
-    # api コマンドの場合は endpoint から repo を抽出
-    if [[ -z "$repo" && "$subcommand" == "api" ]]; then
+    # api コマンドの場合は endpoint から repo を抽出（優先）
+    if [[ "$subcommand" == "api" ]]; then
         # 第2引数が endpoint
         local endpoint="$2"
         if [[ -n "$endpoint" ]]; then
             repo=$(get_repo_from_api_endpoint "$endpoint")
         fi
+    fi
+
+    # -R オプションから取得
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_args "$@")
+    fi
+
+    # git remote から取得
+    if [[ -z "$repo" ]]; then
+        repo=$(get_repo_from_git)
     fi
 
     if [[ -z "$repo" ]]; then
