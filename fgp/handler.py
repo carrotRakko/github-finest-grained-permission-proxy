@@ -307,6 +307,9 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
         if self.headers.get("Accept"):
             headers["Accept"] = self.headers.get("Accept")
 
+        if self.headers.get("Content-Encoding"):
+            headers["Content-Encoding"] = self.headers.get("Content-Encoding")
+
         req = Request(url, data=body, headers=headers, method=method)
 
         with urlopen(req, timeout=60) as response:
