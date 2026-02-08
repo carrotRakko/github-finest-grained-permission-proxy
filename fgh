@@ -561,20 +561,40 @@ main() {
         return
     fi
 
-    # issue/pr の引数なし or --help は gh に直接流す
+    # issue/pr with no args or --help: show help
     if [[ "$subcommand" == "issue" || "$subcommand" == "pr" ]]; then
         local second_arg="$2"
+        local needs_help=false
         if [[ -z "$second_arg" || "$second_arg" == "--help" || "$second_arg" == "-h" ]]; then
-            gh "$subcommand" --help
+            needs_help=true
+        else
+            for arg in "$@"; do
+                if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+                    needs_help=true
+                    break
+                fi
+            done
+        fi
+        if $needs_help; then
+            if [[ "$(basename "$0")" == "fgh" ]]; then
+                gh "$subcommand" --help
+            else
+                # Running as 'gh' (--replace mode): route help through proxy
+                local help_repo
+                help_repo=$(get_repo_from_args "$@")
+                if [[ -z "$help_repo" ]]; then
+                    help_repo=$(get_repo_from_git)
+                fi
+                if [[ -n "$help_repo" ]]; then
+                    call_proxy_cli "$help_repo" "$subcommand" "--help"
+                else
+                    echo "Usage: gh $subcommand <command> [flags]"
+                    echo ""
+                    echo "Run 'gh $subcommand <command> --help' in a git repository for detailed help."
+                fi
+            fi
             return
         fi
-        # Check for --help anywhere in args
-        for arg in "$@"; do
-            if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
-                gh "$subcommand" --help
-                return
-            fi
-        done
     fi
 
     # owner/repo を取得
