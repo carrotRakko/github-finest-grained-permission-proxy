@@ -8,11 +8,13 @@ Each command module provides:
 """
 
 from . import discussion
+from . import issue
 from . import sub_issue
 
 # Registry of all command modules
 COMMAND_MODULES = {
     "discussion": discussion,
+    "issue": issue,
     "sub-issue": sub_issue,
 }
 
