@@ -193,6 +193,9 @@ class GitHubProxyHandler(BaseHTTPRequestHandler):
             # Check if it's a custom command
             if cmd in COMMAND_MODULES:
                 result = execute_command(cmd, args[1:], owner, repo_name, pat)
+                if result is None:
+                    # Module declined to handle; fall through to gh CLI
+                    result = self.execute_gh_cli(args, repo, pat)
             else:
                 # Standard gh command via subprocess
                 result = self.execute_gh_cli(args, repo, pat)
