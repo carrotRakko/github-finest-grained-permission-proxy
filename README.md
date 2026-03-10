@@ -1,5 +1,9 @@
 # GitHub Finest-Grained Permission Proxy
 
+> **⚠️ This project has been superseded by [finest-grained-auth-proxy (fgap)](https://github.com/delight-co/finest-grained-auth-proxy).**
+>
+> fgap extends fgp with multi-CLI support (GitHub + Google) via a plugin system. This repository is no longer maintained.
+
 > **0.x - Unstable API**: This project is in early development. The API may change without notice. Use at your own risk.
 
 A proxy that isolates GitHub PATs from AI agents running in containers.
